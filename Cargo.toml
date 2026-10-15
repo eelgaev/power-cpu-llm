@@ -1,0 +1,49 @@
+[package]
+name = "power-cpu-llm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "CPU inference engine for POWER9: Gemma 4 and DiffusionGemma GGUF models behind an OpenAI-compatible server"
+license = "LGPL-2.1-or-later"
+
+[[bin]]
+name = "power-cpu-llm"
+path = "src/main.rs"
+
+[features]
+default = ["power9"]
+# POWER9 assembly, only on PowerPC64; selection is runtime-gated on Linux.
+power9 = []
+# Test oracle only: ggml's GGUF reader and dequantizers (builds vendor/ggml with
+# cmake/C++), never used at runtime.
+reference-oracle = []
+
+[dependencies]
+rand = "0.9"
+rand_chacha = "0.9"
+libc = "0.2"
+minijinja = { version = "=2.24.0", features = ["preserve_order"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+axum = { version = "0.8", features = ["http1", "json", "tokio"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+serde = { version = "1", features = ["derive"] }
+futures-core = "0.3"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+cmake = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Optional, slower to build: fat (whole-program) LTO. With RUSTFLAGS it can also
+# target the POWER9 CPU directly (see README, "Optimized build"):
+#   RUSTFLAGS="-C target-cpu=pwr9" cargo build --profile release-max
+# panic stays "unwind": the worker pool catches and reports worker panics.
+[profile.release-max]
+inherits = "release"
+lto = "fat"

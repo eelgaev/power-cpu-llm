@@ -1,0 +1,8 @@
+# name encoding_id rows cols positions tensor first_row
+# source diffusiongemma-26B-A4B-it-Q4_K_M.gguf (16806810208 bytes); extractor sha256 c4149f16d4d612f9ff0b29556ed491ef675105426316f92f72335dcb8850602a
+q4k_attn_q 12 16 2816 3 blk.0.attn_q.weight 100
+q6k_attn_v 14 16 2816 3 blk.0.attn_v.weight 0
+q8_0_ffn_down 8 16 2112 3 blk.0.ffn_down.weight 0
+q5_0_self_cond_down 6 16 2112 3 self_cond_down.weight 0
+f32_router 0 4 2816 3 blk.0.ffn_gate_inp.weight 0
+q6k_token_embd 14 16 2816 3 token_embd.weight 9000

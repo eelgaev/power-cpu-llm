@@ -1,0 +1,1028 @@
+{
+ "provenance": {
+  "model": "google/diffusiongemma-26B-A4B-it",
+  "revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b",
+  "tokenizer_json_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+  "response_schema": {
+   "properties": {
+    "content": {
+     "type": "string"
+    },
+    "role": {
+     "const": "assistant"
+    },
+    "thinking": {
+     "type": "string"
+    },
+    "tool_calls": {
+     "items": {
+      "properties": {
+       "function": {
+        "properties": {
+         "arguments": {
+          "additionalProperties": {},
+          "type": "object",
+          "x-parser": "gemma4-tool-call"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "type": "object",
+        "x-regex": "call\\:(?P<name>\\w+)(?P<arguments>\\{.*\\})"
+       },
+       "type": {
+        "const": "function"
+       }
+      },
+      "type": "object"
+     },
+     "type": "array",
+     "x-regex-iterator": "<\\|tool_call>(.*?)<tool_call\\|>"
+    }
+   },
+   "type": "object",
+   "x-regex": "(\\<\\|channel\\>thought\\n(?P<thinking>.*?)\\<channel\\|\\>)?(?P<tool_calls>\\<\\|tool_call\\>.*\\<tool_call\\|\\>)?(?P<content>(?:(?!\\<turn\\|\\>)(?!\\<\\|tool_response\\>).)+)?(?:\\<turn\\|\\>|\\<\\|tool_response\\>)?"
+  },
+  "oracle": "transformers 5.0.0 recursive_parse (pinned response_schema); tokenizers 0.22.2",
+  "model_card": "README @ revision: '<|channel>thought\\n[reasoning]<channel|>[final answer]'; disabled thinking still emits '<|channel>thought\\n<channel|>'",
+  "generation_config_eos_token_id": [
+   1,
+   106,
+   50
+  ],
+  "procedure": "scripts/reference-output/produce.py"
+ },
+ "vocab_subset": {
+  "0": "<pad>",
+  "1": "<eos>",
+  "2": "<bos>",
+  "4": "<mask>",
+  "48": "<|tool_call>",
+  "49": "<tool_call|>",
+  "50": "<|tool_response>",
+  "51": "<tool_response|>",
+  "52": "<|\"|>",
+  "98": "<|think|>",
+  "100": "<|channel>",
+  "101": "<channel|>",
+  "105": "<|turn>",
+  "106": "<turn|>",
+  "107": "\n",
+  "108": "\n\n",
+  "138": "\u2581\u2581",
+  "366": "<0x80>",
+  "367": "<0x81>",
+  "368": "<0x82>",
+  "398": "<0xA0>",
+  "433": "<0xC3>",
+  "464": "<0xE2>",
+  "481": "<0xF3>",
+  "511": "is",
+  "518": "\u2581b",
+  "521": "ou",
+  "563": "\u2581is",
+  "594": "th",
+  "786": "\u2581me",
+  "951": "\u2581no",
+  "1123": "\u2581x",
+  "1509": "It",
+  "1734": "pre",
+  "1751": "\u2581think",
+  "1816": "\u2581text",
+  "2364": "user",
+  "3128": "Par",
+  "4368": "model",
+  "5851": "\u2581fine",
+  "6481": "Let",
+  "6639": "call",
+  "6972": "\u2581thinking",
+  "7102": "\u2581channel",
+  "7546": "\u2581ok",
+  "8960": "only",
+  "9079": "\u2581Paris",
+  "9259": "Hello",
+  "10979": "Hi",
+  "11896": "Just",
+  "12027": "channel",
+  "14433": "answer",
+  "16454": "{}",
+  "18082": "filled",
+  "28263": "analysis",
+  "28507": "\u2581reasoning",
+  "40016": "still",
+  "45518": "thought",
+  "50429": "Paris",
+  "94951": "\u65e5\u672c\u8a9e",
+  "111038": "|>",
+  "236743": "\u2581",
+  "236746": "a",
+  "236755": "c",
+  "236760": "f",
+  "236761": ".",
+  "236762": "y",
+  "236763": "b",
+  "236764": ",",
+  "236781": "x",
+  "236783": "}",
+  "236787": ":",
+  "236813": ">",
+  "236820": "<",
+  "236909": "|",
+  "237243": "\u200d",
+  "243767": "\ud83d\udc69",
+  "243874": "\ud83d\udc68",
+  "244814": "\ud83d\udc67",
+  "258880": "<|image|>"
+ },
+ "cases": [
+  {
+   "name": "observed_full_width_run",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    50429,
+    1
+   ],
+   "source": "oracle",
+   "note": "real full-width/default-step run: empty thought block, content 'Paris', <eos>",
+   "expected": {
+    "content": "Paris",
+    "reasoning": "",
+    "status": "complete",
+    "terminator": "eos"
+   }
+  },
+  {
+   "name": "thinking_then_answer_turn_end",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    6481,
+    786,
+    1751,
+    236761,
+    107,
+    1509,
+    563,
+    9079,
+    236761,
+    101,
+    50429,
+    236761,
+    106
+   ],
+   "source": "oracle",
+   "note": "",
+   "expected": {
+    "content": "Paris.",
+    "reasoning": "Let me think.\nIt is Paris.",
+    "status": "complete",
+    "terminator": "turn_end"
+   }
+  },
+  {
+   "name": "empty_thought_turn_end",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    9259,
+    106
+   ],
+   "source": "oracle",
+   "note": "",
+   "expected": {
+    "content": "Hello",
+    "reasoning": "",
+    "status": "complete",
+    "terminator": "turn_end"
+   }
+  },
+  {
+   "name": "plain_no_channel",
+   "context": "model_turn",
+   "ids": [
+    11896,
+    1816,
+    236764,
+    951,
+    7102,
+    236761,
+    1
+   ],
+   "source": "oracle",
+   "note": "no channel markers at all: everything is content",
+   "expected": {
+    "content": "Just text, no channel.",
+    "reasoning": null,
+    "status": "complete",
+    "terminator": "eos"
+   }
+  },
+  {
+   "name": "empty_content_after_thought",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    8960,
+    6972,
+    101,
+    1
+   ],
+   "source": "oracle",
+   "note": "",
+   "expected": {
+    "content": "",
+    "reasoning": "only thinking",
+    "status": "complete",
+    "terminator": "eos"
+   }
+  },
+  {
+   "name": "empty_everything",
+   "context": "model_turn",
+   "ids": [
+    1
+   ],
+   "source": "oracle",
+   "note": "",
+   "expected": {
+    "content": "",
+    "reasoning": null,
+    "status": "complete",
+    "terminator": "eos"
+   }
+  },
+  {
+   "name": "unicode_and_byte_fallback",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    94951,
+    236743,
+    481,
+    398,
+    366,
+    367,
+    101,
+    243874,
+    237243,
+    243767,
+    237243,
+    244814,
+    7546,
+    106
+   ],
+   "source": "oracle",
+   "note": "",
+   "expected": {
+    "content": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 ok",
+    "reasoning": "\u65e5\u672c\u8a9e \udb40\udc01",
+    "status": "complete",
+    "terminator": "turn_end"
+   }
+  },
+  {
+   "name": "reasoning_with_newlines_and_spaces",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    138,
+    236746,
+    108,
+    518,
+    138,
+    101,
+    107,
+    1123,
+    236743,
+    107,
+    1
+   ],
+   "source": "oracle",
+   "note": "",
+   "expected": {
+    "content": "\n x \n",
+    "reasoning": "  a\n\n b  ",
+    "status": "complete",
+    "terminator": "eos"
+   }
+  },
+  {
+   "name": "truncated_inside_reasoning",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    40016,
+    6972
+   ],
+   "source": "policy",
+   "note": "length-truncated: reasoning stays reasoning; never closed, never content",
+   "expected": {
+    "content": "",
+    "reasoning": "still thinking",
+    "status": "incomplete_unclosed_reasoning",
+    "terminator": null,
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "<|channel>thought\nstill thinking",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "truncated_inside_header",
+   "context": "model_turn",
+   "ids": [
+    100,
+    594,
+    521
+   ],
+   "source": "policy",
+   "note": "header bytes withheld; nothing emitted",
+   "expected": {
+    "content": "",
+    "reasoning": null,
+    "status": "incomplete_unclosed_reasoning",
+    "terminator": null,
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "<|channel>thou",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "truncated_content_no_terminator",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    3128
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "Par",
+    "reasoning": "",
+    "status": "incomplete_truncated_content",
+    "terminator": null,
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "Par",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "eos_inside_reasoning",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    236781,
+    1
+   ],
+   "source": "policy",
+   "note": "no invented <channel|>",
+   "expected": {
+    "content": "",
+    "reasoning": "x",
+    "status": "error",
+    "terminator": null,
+    "error": "terminator_inside_reasoning"
+   },
+   "oracle_text_regex": {
+    "content": "<|channel>thought\nx<eos>",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "marker_spelled_as_ordinary_text",
+   "context": "model_turn",
+   "ids": [
+    236820,
+    236909,
+    12027,
+    236813,
+    45518,
+    107,
+    236820,
+    12027,
+    111038,
+    50429,
+    1
+   ],
+   "source": "policy",
+   "note": "ordinary tokens spelling a marker are content; the text regex wrongly reads them as structure",
+   "expected": {
+    "content": "<|channel>thought\n<channel|>Paris",
+    "reasoning": null,
+    "status": "complete",
+    "terminator": "eos",
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "Paris<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "thought_word_in_content",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    45518,
+    107,
+    511,
+    5851,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "thought\nis fine",
+    "reasoning": "",
+    "status": "complete",
+    "terminator": "eos",
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "thought\nis fine<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "unknown_channel_name",
+   "context": "model_turn",
+   "ids": [
+    100,
+    28263,
+    107,
+    236781,
+    101,
+    236762,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "",
+    "reasoning": null,
+    "status": "error",
+    "terminator": null,
+    "error": "unknown_channel_header"
+   },
+   "oracle_text_regex": {
+    "content": "<|channel>analysis\nx<channel|>y<eos>",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "adjacent_thought_spans",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    236746,
+    101,
+    100,
+    45518,
+    107,
+    236763,
+    101,
+    236755,
+    1
+   ],
+   "source": "policy",
+   "note": "consecutive spans before any content: reasoning concatenated",
+   "expected": {
+    "content": "c",
+    "reasoning": "ab",
+    "status": "complete",
+    "terminator": "eos",
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "<|channel>thought\nb<channel|>c<eos>",
+    "role": "assistant",
+    "thinking": "a"
+   }
+  },
+  {
+   "name": "channel_after_content",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236755,
+    100,
+    45518,
+    107,
+    236781,
+    101,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "c",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "channel_after_content"
+   },
+   "oracle_text_regex": {
+    "content": "c<|channel>thought\nx<channel|><eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "close_without_open",
+   "context": "model_turn",
+   "ids": [
+    236746,
+    101,
+    236763,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": null,
+    "status": "error",
+    "terminator": null,
+    "error": "unexpected_control"
+   },
+   "oracle_text_regex": {
+    "content": "a<channel|>b<eos>",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "new_turn_open_in_output",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    105,
+    2364,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unexpected_control"
+   },
+   "oracle_text_regex": {
+    "content": "a<|turn>user<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "unexpected_bos",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    2,
+    236763,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unexpected_control"
+   },
+   "oracle_text_regex": {
+    "content": "a<bos>b<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "unexpected_pad",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    0,
+    236763,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unexpected_control"
+   },
+   "oracle_text_regex": {
+    "content": "a<pad>b<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "unexpected_think",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    98,
+    236763,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unexpected_control"
+   },
+   "oracle_text_regex": {
+    "content": "a<|think|>b<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "unexpected_mask",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    4,
+    236763,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unexpected_control"
+   },
+   "oracle_text_regex": {
+    "content": "a<mask>b<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "tool_call_unsupported",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    48,
+    6639,
+    236787,
+    236760,
+    16454,
+    49,
+    50
+   ],
+   "source": "policy",
+   "note": "text-only engine: never content, never executed",
+   "expected": {
+    "content": "",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unsupported_tool_structure"
+   },
+   "oracle_text_regex": {
+    "oracle_error": "Unknown parser gemma4-tool-call for schema node: {'additionalProperties': {}, 'type': 'object', 'x-parser': 'gemma4-tool-call'}"
+   }
+  },
+  {
+   "name": "tool_response_stop_unsupported",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    50
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": "",
+    "status": "error",
+    "terminator": null,
+    "error": "unsupported_tool_structure"
+   },
+   "oracle_text_regex": {
+    "content": "a",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "quote_escape_unsupported",
+   "context": "model_turn",
+   "ids": [
+    236746,
+    52,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": null,
+    "status": "error",
+    "terminator": null,
+    "error": "unsupported_tool_structure"
+   },
+   "oracle_text_regex": {
+    "content": "a<|\"|><eos>",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "media_unsupported",
+   "context": "model_turn",
+   "ids": [
+    236746,
+    258880,
+    1
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a",
+    "reasoning": null,
+    "status": "error",
+    "terminator": null,
+    "error": "unsupported_media"
+   },
+   "oracle_text_regex": {
+    "content": "a<|image|><eos>",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "invalid_utf8_bytes",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    433,
+    236763,
+    1
+   ],
+   "source": "policy",
+   "note": "invalid byte sequence -> one U+FFFD per invalid sequence (lossy streaming)",
+   "expected": {
+    "content": "a\ufffdb",
+    "reasoning": "",
+    "status": "complete",
+    "terminator": "eos",
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "a\ufffdb<eos>",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "truncated_utf8_at_end",
+   "context": "model_turn",
+   "ids": [
+    100,
+    45518,
+    107,
+    101,
+    236746,
+    464,
+    368
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "a\ufffd",
+    "reasoning": "",
+    "status": "incomplete_truncated_content",
+    "terminator": null,
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "a\ufffd\ufffd",
+    "role": "assistant",
+    "thinking": ""
+   }
+  },
+  {
+   "name": "inside_thought_context",
+   "context": "inside_thought",
+   "ids": [
+    1734,
+    18082,
+    28507,
+    101,
+    14433,
+    1
+   ],
+   "source": "policy",
+   "note": "canonical template prefix ending '<|channel>thought\\n' (tool response + thinking): parser starts in reasoning",
+   "expected": {
+    "content": "answer",
+    "reasoning": "prefilled reasoning",
+    "status": "complete",
+    "terminator": "eos",
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "prefilled reasoning<channel|>answer<eos>",
+    "role": "assistant"
+   }
+  },
+  {
+   "name": "inside_thought_truncated",
+   "context": "inside_thought",
+   "ids": [
+    236781
+   ],
+   "source": "policy",
+   "note": "",
+   "expected": {
+    "content": "",
+    "reasoning": "x",
+    "status": "incomplete_unclosed_reasoning",
+    "terminator": null,
+    "error": null
+   },
+   "oracle_text_regex": {
+    "content": "x",
+    "role": "assistant"
+   }
+  }
+ ],
+ "prefixes": [
+  {
+   "template": "canonical",
+   "enable_thinking": false,
+   "tail_ids": [
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ],
+   "expected_context": "model_turn"
+  },
+  {
+   "template": "canonical",
+   "enable_thinking": true,
+   "tail_ids": [
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ],
+   "expected_context": "model_turn"
+  },
+  {
+   "template": "canonical",
+   "enable_thinking": false,
+   "add_generation_prompt": false,
+   "tail_ids": [
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107
+   ],
+   "expected_context": "unsupported"
+  },
+  {
+   "template": "gguf",
+   "enable_thinking": false,
+   "tail_ids": [
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ],
+   "expected_context": "model_turn"
+  },
+  {
+   "template": "gguf",
+   "enable_thinking": true,
+   "tail_ids": [
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107
+   ],
+   "expected_context": "model_turn"
+  },
+  {
+   "template": "gguf",
+   "enable_thinking": false,
+   "add_generation_prompt": false,
+   "tail_ids": [
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107
+   ],
+   "expected_context": "unsupported"
+  },
+  {
+   "template": "canonical",
+   "enable_thinking": true,
+   "after_tool_response": true,
+   "tail_ids": [
+    52,
+    236783,
+    51,
+    100,
+    45518,
+    107
+   ],
+   "expected_context": "inside_thought"
+  }
+ ]
+}
