@@ -251,9 +251,24 @@ pub(crate) fn chat(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let mut logits = model.logits(&file, hidden.last().expect("prompt"), compute)?;
     let prefill = start.elapsed().as_secs_f64();
     let stats = std::env::var_os("POWER_LLM_STATS").is_some();
-    // Decode-only stage totals: drop the prefill's.
-    stats::take();
-    stats::take_stage_pool();
+    // The prefill's stage totals (printed with POWER_LLM_STATS), then the
+    // decode's alone.
+    let prompt_stages = stats::take();
+    let prompt_pool = stats::take_stage_pool();
+    if stats {
+        eprintln!("Prompt stages, s (pool submissions, wall s, summed task s):");
+        for (name, seconds) in prompt_stages {
+            if seconds > 0.0 {
+                let pool = prompt_pool.iter().find(|p| p.0 == name);
+                match pool {
+                    Some((_, n, wall, busy)) => {
+                        eprintln!("  {seconds:7.3}  {name}  ({n}, {wall:.3}, {busy:.3})")
+                    }
+                    None => eprintln!("  {seconds:7.3}  {name}"),
+                }
+            }
+        }
+    }
     eprintln!(
         "Prompt: {} tokens in {prefill:.2} s ({:.1} tok/s)",
         ids.len(),

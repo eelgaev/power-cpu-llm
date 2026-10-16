@@ -14,8 +14,8 @@ use crate::engine::operators::{
 use crate::engine::stats::{Span, Stage};
 use crate::engine::weights::{ModelFile, row_count};
 use crate::gguf::TensorInfo;
-use crate::kernels::deltanet;
 use crate::kernels::reference as math;
+use crate::kernels::{deltanet, dot_tile};
 use crate::libm;
 use std::sync::{Arc, Mutex};
 
@@ -98,23 +98,6 @@ fn dot_f64(w: &[f32], x: &[f32]) -> f64 {
     ((partial[0] + partial[1]) + (partial[2] + partial[3]))
         + ((partial[4] + partial[5]) + (partial[6] + partial[7]))
 }
-/// `sum(w[i] x[i])` in binary32 with eight interleaved partial sums added
-/// in a fixed order (vectorizes).
-fn dot_f32(w: &[f32], x: &[f32]) -> f32 {
-    let mut partial = [0.0f32; 8];
-    let (w8, w_tail) = w.as_chunks::<8>();
-    let (x8, x_tail) = x.as_chunks::<8>();
-    for (w, x) in w8.iter().zip(x8) {
-        for i in 0..8 {
-            partial[i] += w[i] * x[i];
-        }
-    }
-    for (i, (w, x)) in w_tail.iter().zip(x_tail).enumerate() {
-        partial[i] += w * x;
-    }
-    ((partial[0] + partial[1]) + (partial[2] + partial[3]))
-        + ((partial[4] + partial[5]) + (partial[6] + partial[7]))
-}
 /// Every row of a small row-major matrix times each input, row chunks on
 /// the workers.
 fn small_projection(
@@ -131,6 +114,35 @@ fn small_projection(
     let chunks = rows.div_ceil(ROWS);
     // Exact (F64) for the exact backends, binary32 for the integer ones.
     let approximate = compute.kernels.approximate();
+    if approximate && input.len() >= 4 && rows.is_multiple_of(4) {
+        // Groups of 4 inputs (the last one overlapping) x row chunks, in
+        // 4 x 4 tiles.
+        let groups = input.len().div_ceil(4);
+        let parts = compute.map_positions(groups * chunks, |i| {
+            let (g, c) = (i / chunks, i % chunks);
+            let p0 = (4 * g).min(input.len() - 4);
+            let x: [&[f32]; 4] = std::array::from_fn(|k| input[p0 + k].as_slice());
+            let end = ((c + 1) * ROWS).min(rows);
+            let mut out = vec![[0.0f32; 4]; end - c * ROWS];
+            for r0 in (c * ROWS..end).step_by(4) {
+                let tile = dot_tile::dot_f32_tile(matrix, r0, x);
+                for k in 0..4 {
+                    out[r0 + k - c * ROWS] = tile[k];
+                }
+            }
+            Ok::<_, Error>((p0, out))
+        })?;
+        let mut rows_out = vec![vec![0.0f32; rows]; input.len()];
+        for (i, (p0, out)) in parts.into_iter().enumerate() {
+            let c = i % chunks;
+            for (r, values) in out.iter().enumerate() {
+                for (k, &v) in values.iter().enumerate() {
+                    rows_out[p0 + k][c * ROWS + r] = v;
+                }
+            }
+        }
+        return Ok(rows_out);
+    }
     let parts = compute.map_positions(input.len() * chunks, |i| {
         let (p, c) = (i / chunks, i % chunks);
         let end = ((c + 1) * ROWS).min(rows);
@@ -139,7 +151,7 @@ fn small_projection(
                 .map(|r| {
                     let row = &matrix[r * cols..(r + 1) * cols];
                     if approximate {
-                        dot_f32(row, &input[p])
+                        dot_tile::dot_f32(row, &input[p])
                     } else {
                         dot_f64(row, &input[p]) as f32
                     }
@@ -332,38 +344,54 @@ fn linear(
     let norm = load_all(file, b.norm)?;
     let scale = (1.0 / (n as f64).sqrt()) as f32;
     let eps = spec.rms_epsilon;
-    let mut gated = Vec::with_capacity(input.len());
-    for p in 0..input.len() {
-        let xqkv = &qkv[p];
-        let state_rows: &[f32] = conv_state;
-        // Causal depthwise convolution (no bias), then SiLU, of channel c.
-        let conv = |c: usize| {
-            let taps = &conv_weight[c * kernel..(c + 1) * kernel];
-            let mut sum = 0.0f64;
-            for (k, &w) in taps[..kernel - 1].iter().enumerate() {
-                sum += f64::from(w) * f64::from(state_rows[k * channels + c]);
-            }
-            sum += f64::from(taps[kernel - 1]) * f64::from(xqkv[c]);
-            silu(sum as f32)
-        };
-        let slots: Vec<Mutex<&mut [f32]>> = ssm.chunks_mut(n * n).map(Mutex::new).collect();
-        // One item per key head: tiled value heads j = kh, kh + key_heads, ...
-        // share its q and k, computed once.
-        let per_key = compute.map_positions(key_heads, |kh| {
-            let mut q: Vec<f32> = (0..n).map(|i| conv(kh * n + i)).collect();
-            let mut k: Vec<f32> = (0..n).map(|i| conv(key_width + kh * n + i)).collect();
+    let positions = input.len();
+    let state_rows: &[f32] = conv_state;
+    // Causal depthwise convolution (no bias), then SiLU, of channel c at
+    // position p: taps over the previous kernel - 1 inputs (the carried
+    // state before position 0), then the current one.
+    let conv = |c: usize, p: usize| {
+        let taps = &conv_weight[c * kernel..(c + 1) * kernel];
+        let mut sum = 0.0f64;
+        for (t, &w) in taps[..kernel - 1].iter().enumerate() {
+            // Input position p - (kernel - 1) + t; the state's row r holds
+            // position r - (kernel - 1).
+            let back = p + t;
+            let x = if back < kernel - 1 {
+                state_rows[back * channels + c]
+            } else {
+                qkv[back - (kernel - 1)][c]
+            };
+            sum += f64::from(w) * f64::from(x);
+        }
+        sum += f64::from(taps[kernel - 1]) * f64::from(qkv[p][c]);
+        silu(sum as f32)
+    };
+    let slots: Vec<Mutex<&mut [f32]>> = ssm.chunks_mut(n * n).map(Mutex::new).collect();
+    // One item per key head over every position: its tiled value heads
+    // j = kh, kh + key_heads, ... share its q and k, and their states stay
+    // in the worker's cache for the whole prompt (one submission per layer;
+    // each head's recurrence runs in position order, as before).
+    let per_key = compute.map_positions(key_heads, |kh| {
+        let mut states: Vec<_> = (kh..spec.value_heads)
+            .step_by(key_heads)
+            .map(|j| slots[j].lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let mut rows = Vec::with_capacity(positions);
+        for p in 0..positions {
+            let mut q: Vec<f32> = (0..n).map(|i| conv(kh * n + i, p)).collect();
+            let mut k: Vec<f32> = (0..n).map(|i| conv(key_width + kh * n + i, p)).collect();
             l2_norm(&mut q, eps);
             l2_norm(&mut k, eps);
-            let mut heads = Vec::new();
-            for j in (kh..spec.value_heads).step_by(key_heads) {
-                let v: Vec<f32> = (0..n).map(|i| conv(2 * key_width + j * n + i)).collect();
+            let mut heads = Vec::with_capacity(states.len());
+            for (t, m) in states.iter_mut().enumerate() {
+                let j = kh + t * key_heads;
+                let v: Vec<f32> = (0..n).map(|i| conv(2 * key_width + j * n + i, p)).collect();
                 let g = softplus(f64::from(alpha[p][j]) + f64::from(dt_bias[j])) * f64::from(a[j]);
                 let decay = libm::exp(g) as f32;
                 let beta = sigmoid(f64::from(beta[p][j])) as f32;
-                let mut m = slots[j].lock().unwrap_or_else(|e| e.into_inner());
                 let mut out = vec![0.0f32; n];
                 // m[jv][i] = S[i][jv]: decay, delta rule, read out.
-                deltanet::head_update(&mut m, &k, &q, &v, decay, beta, scale, &mut out);
+                deltanet::head_update(m, &k, &q, &v, decay, beta, scale, &mut out);
                 // Gated norm: rms_norm(o) * silu(z).
                 let normed = math::rms_norm(&out, Some(&norm), eps)?;
                 let zh = &z[p][j * n..(j + 1) * n];
@@ -375,19 +403,30 @@ fn linear(
                         .collect::<Vec<f32>>(),
                 );
             }
-            Ok::<_, Error>(heads)
-        })?;
-        let mut row = vec![0.0f32; spec.value_heads * n];
-        for (kh, heads) in per_key.iter().enumerate() {
+            rows.push(heads);
+        }
+        Ok::<_, Error>(rows)
+    })?;
+    drop(slots);
+    let mut gated = vec![vec![0.0f32; spec.value_heads * n]; positions];
+    for (kh, rows) in per_key.iter().enumerate() {
+        for (row, heads) in gated.iter_mut().zip(rows) {
             for (t, head) in heads.iter().enumerate() {
                 let j = kh + t * key_heads;
                 row[j * n..(j + 1) * n].copy_from_slice(head);
             }
         }
-        drop(slots);
-        conv_state.copy_within(channels.., 0);
-        conv_state[(kernel - 2) * channels..].copy_from_slice(xqkv);
-        gated.push(row);
+    }
+    // The carried state: the last kernel - 1 inputs, oldest first (row t
+    // holds position positions - keep + t: a later state row, or an input).
+    let keep = kernel - 1;
+    for t in 0..keep {
+        let at = positions + t;
+        if at < keep {
+            conv_state.copy_within(at * channels..(at + 1) * channels, t * channels);
+        } else {
+            conv_state[t * channels..(t + 1) * channels].copy_from_slice(&qkv[at - keep]);
+        }
     }
     drop(span);
     let _span = Span::new(Stage::MambaProjections);
@@ -539,7 +578,9 @@ fn moe(
     let spec = &model.spec;
     let span = Span::new(Stage::Router);
     let router = small_projection(&cached_matrix(file, b.router)?, input, compute)?;
-    let routes: Vec<_> = router.iter().map(|l| route(l, spec.top_k)).collect();
+    let routes = compute.map_positions(router.len(), |p| {
+        Ok::<_, Error>(route(&router[p], spec.top_k))
+    })?;
     let shared_gate_input = load_all(file, b.shared_gate_input)?;
     drop(span);
     let span = Span::new(Stage::SharedMlp);

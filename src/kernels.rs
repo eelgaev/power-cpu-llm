@@ -5,6 +5,7 @@ use std::ffi::{CStr, c_char, c_int};
 use std::fmt;
 
 pub mod deltanet;
+pub mod dot_tile;
 pub mod encoded;
 pub mod quantized;
 pub mod reference;

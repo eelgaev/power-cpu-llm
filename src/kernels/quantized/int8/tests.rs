@@ -1375,6 +1375,44 @@ fn packed_encoding_throughput() {
     }
 }
 
+/// Diagnostic: packed projection throughput over prompt-sized batches
+/// (positions = 2 x tokens on the two-plane backend), single thread, in
+/// cache: multiply-adds per ns.
+#[test]
+#[ignore]
+fn packed_batch_throughput() {
+    let Ok(k) = FmaKernels::new(Request::Power9Int8) else {
+        return;
+    };
+    for (encoding, rows, cols) in [
+        (Encoding::Q4K, 512, 2048),
+        (Encoding::Q6K, 2048, 512),
+        (Encoding::Q5K, 2048, 512),
+        (Encoding::Q8_0, 2048, 2048),
+    ] {
+        let mut rng = Rng(11);
+        let bytes = weights(encoding, rows, cols, &mut rng);
+        let w = EncodedRows::new(encoding, rows, cols, &bytes).unwrap();
+        let packed = k.pack(&w).unwrap();
+        let mut line = format!("{encoding:?} {rows}x{cols}:");
+        for positions in [2, 8, 16, 40, 64, 128] {
+            let x = activations(positions, cols, &mut rng);
+            let input = QuantizedInput::new(encoding, &x, positions, cols).unwrap();
+            let mut out = vec![0.0f32; positions * rows];
+            let mut best = f64::MAX;
+            for _ in 0..10 {
+                let start = std::time::Instant::now();
+                k.project_packed(&packed, 0, rows, &input, &mut out, rows, 0)
+                    .unwrap();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            let rate = (rows * cols * positions) as f64 / best / 1e9;
+            line += &format!("  p{positions} {rate:.1}");
+        }
+        eprintln!("{line}");
+    }
+}
+
 /// Diagnostic: the cost of the Q5_K offset correction alone.
 #[test]
 #[ignore]
