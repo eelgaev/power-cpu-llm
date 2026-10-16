@@ -103,56 +103,33 @@ It bundles glibc (LGPL-2.1), so if you distribute it, you must let recipients re
 
 ## Performance
 
-These numbers come from an AC922 with two 20-core POWER9 sockets (SMT4), using the default release build. The host is shared, so treat them as indicative. Full results and method are in [docs/benchmarks.md](docs/benchmarks.md).
+Measured on an AC922 with two 20-core POWER9 sockets (SMT4), default release build. The host is shared, so treat the numbers as indicative. The prompt is about 650 tokens; prefill is the rate at which it is encoded, decode the steady-state generation rate. All rates are tokens per second. Full results and method: [docs/benchmarks.md](docs/benchmarks.md).
 
-**Eight cores** (2026-10-15; CPUs 40–71, `numactl --membind=0`, 16 workers). The prompt is 647–651 tokens. Prefill is the time to encode the prompt, and decode is the steady-state rate per token.
+- **8 cores:** CPUs 40–71, `numactl --membind=0`, 16 workers (2026-10-15).
+- **All cores:** CPUs 0–159, 80 workers, `--split-sockets`: prompt chunks are divided between the sockets and decode runs on socket 0 (2026-10-14, a build from before the 8-core kernel work).
 
-| Model | Backend | Prefill tok/s | Decode ms/token |
+| Model | Backend | Prefill, 8 cores | Decode, 8 cores | Prefill, all cores | Decode, all cores |
+|---|---|---:|---:|---:|---:|
+| Gemma 4 E2B | `power9-int8x2` (default) | 69.8 | 28.7 | 109 | 28–32 |
+| Gemma 4 E2B | `power9-int8` | 116.8 | 27.5 | 179 | 27.0 |
+| Gemma 4 E2B | `power9-fma` (exact) | 11.6 | 1.18 | 25.6 | 2.49 |
+| Gemma 4 E2B | `portable` (exact) | 7.7 | 0.81 | 17.7 | 1.66 |
+| Gemma 4 26B-A4B | `power9-int8x2` (default) | 44.4 | 17.5 | 114 | 19.2–19.8 |
+| Gemma 4 26B-A4B | `power9-int8` | 73.4 | 16.8 | 165 | 18.8 |
+| Gemma 4 26B-A4B | `power9-fma` (exact) | 6.2 | 0.68 | 20.3 | 1.39 |
+
+The default `power9-int8x2` produced the same tokens as the exact backends on these prompts; `power9-int8` did not.
+
+**DiffusionGemma** generates 0.79 tok/s on 8 cores and 1.43 tok/s on all cores with `power9-int8x2` (1.20 and 2.15 with `power9-int8`), using the model's own procedure: a 256-token canvas and 26–28 denoising steps. Every step processes the whole canvas, including vocabulary logits. On a CPU, which has no idle compute to absorb that, it is 12–18× slower than Gemma 4 26B-A4B's autoregressive decode.
+
+**Against llama.cpp** (2026-10-07, with an older and slower build of this engine; about 660-token prompt, 64 decoded tokens, CPU only), in tok/s:
+
+| Model | CPUs | Prefill: llama.cpp → power-cpu-llm | Decode: llama.cpp → power-cpu-llm |
 |---|---|---:|---:|
-| Gemma 4 E2B | `power9-int8x2` (default) | 69.8 | 34.8 |
-| Gemma 4 E2B | `power9-int8` | 116.8 | 36.4 |
-| Gemma 4 E2B | `power9-fma` (exact) | 11.6 | 846 |
-| Gemma 4 E2B | `portable` (exact) | 7.7 | 1,233 |
-| Gemma 4 26B-A4B | `power9-int8x2` (default) | 44.4 | 57.0 |
-| Gemma 4 26B-A4B | `power9-int8` | 73.4 | 59.6 |
-| Gemma 4 26B-A4B | `power9-fma` (exact) | 6.2 | 1,476 |
-
-On these prompts, the default `power9-int8x2` produced the same tokens as the exact backends. `power9-int8` did not. Against the previous day's build (62.3 / 40.5 tok/s, 38.0 / 68.2 ms/token), the hand-written prefill tile and epilogue, decode attention, batched GELU and deeper hardware prefetch made the default backend 9–12% faster at prefill and 8–16% faster at decode, with byte-identical output; the exact backends are unchanged.
-
-**All cores** (2026-10-14, before the kernel work above; both sockets, CPUs 0–159, 80 workers, `--split-sockets`: prompt chunks are divided between the sockets, and decode runs on socket 0):
-
-| Model | Backend | Prefill tok/s (651 / 3,194 tokens) | Decode ms/token |
-|---|---|---:|---:|
-| Gemma 4 E2B | `power9-int8x2` (default) | 109 / 106 | 31–36 |
-| Gemma 4 E2B | `power9-int8` | 179 / 170 | 37 |
-| Gemma 4 E2B | `power9-fma` (exact) | 26 / 20 | 402 |
-| Gemma 4 26B-A4B | `power9-int8x2` (default) | 114 / 104 | 50–52 |
-| Gemma 4 26B-A4B | `power9-int8` | 165 / 157 | 53 |
-| Gemma 4 26B-A4B | `power9-fma` (exact) | 20 / 14 | 719 |
-| DiffusionGemma | `power9-int8x2` (default) | 104 | 1.43 tok/s (28 steps × 6.4 s) |
-| DiffusionGemma | `power9-int8` | 169 | 2.15 tok/s (26 steps × 4.6 s) |
-
-E2B's prompt lengths are 647 / 3,190 tokens. Every run produced the same tokens as on eight cores.
-
-**DiffusionGemma** (2026-10-14, eight cores) on the same prompt, with the model's procedure (256-token canvas, adaptive stopping):
-
-| Backend | Denoising steps | s/step | Time for 256 tokens | tok/s |
-|---|---:|---:|---:|---:|
-| `power9-int8x2` (default) | 28 | 11.6 | 324 s | 0.79 |
-| `power9-int8` | 26 | 8.2 | 213 s | 1.20 |
-
-Each denoising step processes all 256 canvas positions, including vocabulary logits. On a CPU, which has no idle compute to absorb that, DiffusionGemma is 12–18× slower than Gemma 4 26B-A4B's autoregressive decode. Diffusion only pays off where per-step compute is nearly free, as on GPUs.
-
-**Against llama.cpp** (2026-10-07, a week before the tables above with an older, slower build of this engine; about 660-token prompt, 64 decoded tokens, CPU only):
-
-| Model | Engine | CPUs | Prompt tok/s | Decode tok/s |
-|---|---|---|---:|---:|
-| 26B-A4B | llama.cpp | socket 0, 40 threads | 17.6 | 8.6 |
-| 26B-A4B | power-cpu-llm | socket 0, 40 workers | **55.8** | **13.7** |
-| 26B-A4B | llama.cpp | both sockets, 80 threads | 28.4 | 12.4 |
-| 26B-A4B | power-cpu-llm `--split-sockets` | both sockets, 80 workers | **84.2** | **13.8** |
-| E2B | llama.cpp | socket 0, 40 threads | 27.2 | 11.0 |
-| E2B | power-cpu-llm | socket 0, 40 workers | **79.1** | **19.0** |
+| 26B-A4B | socket 0 (40 threads) | 17.6 → **55.8** | 8.6 → **13.7** |
+| 26B-A4B | both sockets (80 threads) | 28.4 → **84.2** | 12.4 → **13.8** |
+| E2B | socket 0 (40 threads) | 27.2 → **79.1** | 11.0 → **19.0** |
+| E2B | both sockets (80 threads) | 42.1 → **82.2** | 9.0 → **18.8** |
 
 ## Documentation
 

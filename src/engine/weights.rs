@@ -142,7 +142,16 @@ impl ModelFile {
                 "file changed size during inspection".into(),
             ));
         }
-        if !matches!(inventory.architecture(), Some("diffusion-gemma" | "gemma4")) {
+        if !matches!(
+            inventory.architecture(),
+            Some(
+                "diffusion-gemma"
+                    | "gemma4"
+                    | crate::engine::nemotron::ARCHITECTURE
+                    | crate::engine::assistant::ARCHITECTURE
+                    | crate::engine::qwen35::ARCHITECTURE
+            )
+        ) {
             return Err(Error::UnsupportedArchitecture);
         }
         let mut tensor_ids = BTreeMap::new();

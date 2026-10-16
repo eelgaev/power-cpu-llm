@@ -1,9 +1,11 @@
 use super::super::power9_fma::{FmaKernels, Request};
 use super::*;
 
-const QUANTIZED: [Encoding; 6] = [
+const QUANTIZED: [Encoding; 8] = [
     Encoding::Q4_0,
     Encoding::Q5_0,
+    Encoding::Q5_1,
+    Encoding::Q5K,
     Encoding::Q8_0,
     Encoding::Q4K,
     Encoding::Q6K,
@@ -39,13 +41,13 @@ fn weights(encoding: Encoding, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u
             Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q8_0 => {
                 block[..2].copy_from_slice(&rng.half())
             }
-            Encoding::Q4K => {
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q5_1 => {
                 block[..2].copy_from_slice(&rng.half());
                 block[2..4].copy_from_slice(&rng.half());
             }
             Encoding::Q6K => block[208..].copy_from_slice(&rng.half()),
             Encoding::TQ2_0 => block[64..].copy_from_slice(&rng.half()),
-            Encoding::F32 | Encoding::F16 => unreachable!(),
+            Encoding::F32 | Encoding::F16 | Encoding::BF16 => unreachable!(),
         }
         out.extend(block);
     }
@@ -83,7 +85,7 @@ fn kernels() -> (FmaKernels, Option<FmaKernels>) {
 
 fn shapes(encoding: Encoding) -> Vec<(usize, usize)> {
     let cols: &[usize] = match encoding {
-        Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0 => &[256, 512, 2816],
+        Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0 => &[256, 512, 2816],
         _ => &[32, 96, 704],
     };
     let mut out = Vec::new();
@@ -198,7 +200,10 @@ fn error_is_within_the_activation_rounding_bound() {
     let (portable, native) = kernels();
     let mut rng = Rng(0x9e3779b97f4a7c15);
     for encoding in QUANTIZED {
-        let block = if matches!(encoding, Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0) {
+        let block = if matches!(
+            encoding,
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0
+        ) {
             256
         } else {
             32
@@ -335,7 +340,10 @@ fn transposed_f32_matches_twin_and_f64_within_bound() {
         Encoding::Q4K,
         Encoding::Q6K,
     ] {
-        let cols = if matches!(encoding, Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0) {
+        let cols = if matches!(
+            encoding,
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0
+        ) {
             512
         } else {
             96
@@ -473,7 +481,10 @@ fn grouped_quantization_matches_single_call() {
     let (portable, _) = kernels();
     let mut rng = Rng(0x6006);
     for encoding in QUANTIZED {
-        let cols = if matches!(encoding, Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0) {
+        let cols = if matches!(
+            encoding,
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0
+        ) {
             512
         } else {
             96
@@ -516,13 +527,19 @@ fn power9_group_quantizer_matches_portable() {
         }
         let mut rng = Rng(0x9a17);
         for encoding in QUANTIZED {
-            let cols = if matches!(encoding, Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0) {
+            let cols = if matches!(
+                encoding,
+                Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0
+            ) {
                 512
             } else {
                 96
             };
             let nb = cols
-                / if matches!(encoding, Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0) {
+                / if matches!(
+                    encoding,
+                    Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0
+                ) {
                     256
                 } else {
                     32
@@ -547,7 +564,7 @@ fn power9_group_quantizer_matches_portable() {
                     // SAFETY: buffers sized per the C contract.
                     let code = unsafe {
                         f(
-                            encoding as c_int,
+                            kernel_kind(encoding),
                             rows.as_ptr(),
                             cols,
                             q.as_mut_ptr(),
@@ -1297,6 +1314,159 @@ fn q4_0_tile_block_counts_match_portable_bitwise() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The Q5_K -> Q6_K repack is exact: every Q5_K value is the Q6_K value of
+/// the repacked block plus its 32-value offset, bit for bit.
+#[test]
+fn q5_k_repack_is_exact() {
+    let mut rng = Rng(0x005e_ed5c);
+    let (rows, cols) = (3, 512);
+    let bytes = weights(Encoding::Q5K, rows, cols, &mut rng);
+    let (q6, offsets) = split_q5_k(&bytes);
+    let want = Encoding::Q5K.decode(&bytes, rows * cols).unwrap();
+    let got = Encoding::Q6K.decode(&q6, rows * cols).unwrap();
+    for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+        assert_eq!(w.to_bits(), (g + offsets[i / 32]).to_bits(), "element {i}");
+    }
+}
+
+/// Diagnostic: one-thread packed projection throughput by encoding on the
+/// expert shapes (run with --ignored --nocapture).
+#[test]
+#[ignore]
+fn packed_encoding_throughput() {
+    let Ok(k) = FmaKernels::new(Request::Power9Int8) else {
+        return;
+    };
+    for (encoding, rows, cols) in [
+        (Encoding::Q4K, 1024, 2048),
+        (Encoding::Q5K, 2048, 512),
+        (Encoding::Q6K, 2048, 512),
+        (Encoding::Q5K, 512, 2048),
+        (Encoding::Q6K, 512, 2048),
+        (Encoding::Q5_0, 2048, 512),
+        (Encoding::Q8_0, 2048, 512),
+        (Encoding::Q5_1, 2688, 1856),
+    ] {
+        let mut rng = Rng(11);
+        let bytes = weights(encoding, rows, cols, &mut rng);
+        let w = EncodedRows::new(encoding, rows, cols, &bytes).unwrap();
+        let packed = k.pack(&w).unwrap();
+        let x = activations(2, cols, &mut rng);
+        let input = QuantizedInput::new(encoding, &x, 2, cols).unwrap();
+        let mut out = vec![0.0f32; 2 * rows];
+        let mut best = f64::MAX;
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            k.project_packed(&packed, 0, rows, &input, &mut out, rows, 0)
+                .unwrap();
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "{encoding:?} {rows}x{cols}: {:.1} us, {:.2} weights/ns, packed {:.3} B/weight",
+            best * 1e6,
+            (rows * cols) as f64 / best / 1e9,
+            packed.bytes() as f64 / (rows * cols) as f64
+        );
+    }
+}
+
+/// Diagnostic: the cost of the Q5_K offset correction alone.
+#[test]
+#[ignore]
+fn offset_correction_throughput() {
+    let (rows, cols) = (2048, 512);
+    let mut rng = Rng(11);
+    let bytes = weights(Encoding::Q5K, rows, cols, &mut rng);
+    let (_, offsets) = split_offsets(Encoding::Q5K, &bytes, cols).unwrap();
+    let x = activations(2, cols, &mut rng);
+    let input = QuantizedInput::new(Encoding::Q5K, &x, 2, cols).unwrap();
+    let mut out = vec![0.0f32; 2 * rows];
+    let mut best = f64::MAX;
+    for _ in 0..50 {
+        let start = std::time::Instant::now();
+        add_offsets(&offsets, rows, 0, rows, &input, &mut out, rows, 0).unwrap();
+        best = best.min(start.elapsed().as_secs_f64());
+    }
+    eprintln!("offsets {rows}x{cols}: {:.1} us", best * 1e6);
+}
+
+/// Diagnostic: packed projection throughput with the weights streamed
+/// from DRAM (distinct matrices, ~300 MB in all), as in one-token decode.
+#[test]
+#[ignore]
+fn packed_encoding_cold_throughput() {
+    let Ok(k) = FmaKernels::new(Request::Power9Int8) else {
+        return;
+    };
+    for (encoding, rows, cols) in [
+        (Encoding::Q4K, 512, 2048),
+        (Encoding::Q5K, 512, 2048),
+        (Encoding::Q5K, 2048, 512),
+        (Encoding::Q6K, 2048, 512),
+        (Encoding::Q8_0, 2048, 2048),
+    ] {
+        let mut rng = Rng(11);
+        let bytes = weights(encoding, rows, cols, &mut rng);
+        let w = EncodedRows::new(encoding, rows, cols, &bytes).unwrap();
+        let one = k.pack(&w).unwrap().bytes();
+        let copies = (300 << 20) / one;
+        let packed: Vec<_> = (0..copies).map(|_| k.pack(&w).unwrap()).collect();
+        let x = activations(2, cols, &mut rng);
+        let input = QuantizedInput::new(encoding, &x, 2, cols).unwrap();
+        let mut out = vec![0.0f32; 2 * rows];
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for p in &packed {
+                k.project_packed(p, 0, rows, &input, &mut out, rows, 0)
+                    .unwrap();
+            }
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        let total = (rows * cols * copies) as f64;
+        eprintln!(
+            "{encoding:?} {rows}x{cols} cold: {:.2} weights/ns, {:.1} GB/s packed, {:.1} GB/s gguf",
+            total / best / 1e9,
+            (one * copies) as f64 / best / 1e9,
+            bytes.len() as f64 * copies as f64 / best / 1e9
+        );
+    }
+}
+
+/// The hand-written K-quant decode tiles equal the frozen C kernel bit for
+/// bit, over partial tiles, unaligned row ranges and untouched output cells.
+#[cfg(all(feature = "power9", target_arch = "powerpc64"))]
+#[test]
+fn k_decode_tiles_match_native() {
+    for encoding in [Encoding::Q4K, Encoding::Q6K, Encoding::Q5K] {
+        for (rows, cols) in [(2048, 512), (512, 2048), (36, 256), (16, 768), (130, 1024)] {
+            let mut rng = Rng(rows as u64 * 7 + cols as u64);
+            let bytes = weights(encoding, rows, cols, &mut rng);
+            let w = EncodedRows::new(encoding, rows, cols, &bytes).unwrap();
+            let packed = pack_power9(&w).unwrap();
+            let x = activations(2, cols, &mut rng);
+            let input = QuantizedInput::new(encoding, &x, 2, cols).unwrap();
+            assert!(k_decode(&packed, &input));
+            for (row0, count) in [(0, rows), (3, rows - 5), (17, 1), (rows - 7, 7), (4, 12)] {
+                if row0 + count > rows {
+                    continue;
+                }
+                let stride = count + 3;
+                let mut native = vec![-7.5f32; 2 * stride];
+                let mut tiled = native.clone();
+                let a = project_packed_native(&packed, row0, count, &input, &mut native, stride, 2);
+                let b = project_k_decode(&packed, row0, count, &input, &mut tiled, stride, 2);
+                assert_eq!(a.is_ok(), b.is_ok());
+                let same = native
+                    .iter()
+                    .zip(&tiled)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "{encoding:?} {rows}x{cols} rows {row0}+{count}");
             }
         }
     }

@@ -3,12 +3,15 @@ use super::*;
 use std::ffi::c_int;
 use std::hint::black_box;
 
-const ALL: [Encoding; 6] = [
+const ALL: [Encoding; 9] = [
     Encoding::F32,
+    Encoding::BF16,
     Encoding::Q4_0,
     Encoding::Q5_0,
+    Encoding::Q5_1,
     Encoding::Q8_0,
     Encoding::Q4K,
+    Encoding::Q5K,
     Encoding::Q6K,
 ];
 
@@ -60,12 +63,13 @@ fn random_rows(encoding: Encoding, rows: usize, cols: usize, rng: &mut Rng) -> V
             Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q8_0 => {
                 block[..2].copy_from_slice(&rng.half())
             }
-            Encoding::Q4K => {
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q5_1 => {
                 block[..2].copy_from_slice(&rng.half());
                 block[2..4].copy_from_slice(&rng.half());
             }
             Encoding::Q6K => block[208..].copy_from_slice(&rng.half()),
             Encoding::F16 => block.copy_from_slice(&rng.half()),
+            Encoding::BF16 => block.copy_from_slice(&(rng.unit() * 4.0).to_le_bytes()[2..]),
             Encoding::TQ2_0 => block[64..].copy_from_slice(&rng.half()),
         }
         out.extend(block);
@@ -75,9 +79,15 @@ fn random_rows(encoding: Encoding, rows: usize, cols: usize, rng: &mut Rng) -> V
 
 fn shapes(encoding: Encoding) -> Vec<(usize, usize)> {
     match encoding {
-        Encoding::F32 | Encoding::F16 => vec![(1, 1), (7, 37), (21, 301), (17, 33)],
-        Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q8_0 => vec![(5, 32), (21, 288), (3, 2112)],
-        Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0 => vec![(5, 256), (21, 512), (2, 2816)],
+        Encoding::F32 | Encoding::F16 | Encoding::BF16 => {
+            vec![(1, 1), (7, 37), (21, 301), (17, 33)]
+        }
+        Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q5_1 | Encoding::Q8_0 => {
+            vec![(5, 32), (21, 288), (3, 2112)]
+        }
+        Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0 => {
+            vec![(5, 256), (21, 512), (2, 2816)]
+        }
     }
 }
 

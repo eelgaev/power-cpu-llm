@@ -101,6 +101,8 @@ p9_decode_row_vsx:
 	bge 0, .Lp9_dequant_BB0_11
 	cmplwi	8, 8
 	beq	0, .Lp9_dequant_BB0_15
+	cmplwi	8, 13                           # hand edit: Q5_K -> portable
+	beq	0, .Lp9_dequant_BB0_13
 	cmplwi	8, 12
 	bne	0, .Lp9_dequant_BB0_32
 	li 11, 256
@@ -110,6 +112,8 @@ p9_decode_row_vsx:
 	b .Lp9_dequant_BB0_18
 .Lp9_dequant_BB0_8:
 	beq	0, .Lp9_dequant_BB0_16
+	cmplwi	8, 7                            # hand edit: Q5_1 -> portable
+	beq	0, .Lp9_dequant_BB0_13
 	cmplwi	8, 6
 	bne	0, .Lp9_dequant_BB0_32
 	li 11, 32
@@ -119,6 +123,8 @@ p9_decode_row_vsx:
 	b .Lp9_dequant_BB0_18
 .Lp9_dequant_BB0_11:
 	beq	0, .Lp9_dequant_BB0_17
+	cmplwi	8, 30                           # hand edit: BF16 -> portable
+	beq	0, .Lp9_dequant_BB0_13
 	cmplwi	8, 35
 	bne	0, .Lp9_dequant_BB0_32
 .Lp9_dequant_BB0_13:

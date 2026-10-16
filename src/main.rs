@@ -1,8 +1,11 @@
 mod cli;
 use cli::probe::{probe_forward, probe_model};
-use cli::{full_canvas, generate, long_context, profile, prompt_trace, serve, trace};
+use cli::{
+    full_canvas, generate, long_context, nemotron as nemotron_cli, profile, prompt_trace, serve,
+    trace,
+};
 
-use power_cpu_llm::engine::{diffusion, gguf, model, operators, text, weights};
+use power_cpu_llm::engine::{diffusion, gguf, model, nemotron, operators, qwen35, text, weights};
 use power_cpu_llm::kernels::{
     ActivationBlock, BLOCK_SIZE, Backend, Kernels, Q4WeightBlock, Q8WeightBlock,
 };
@@ -46,7 +49,7 @@ enum Command {
     /// Text-chat generation diagnostic (prints stage times, token IDs and text)
     #[command(
         name = "probe-generation",
-        after_help = "Usage: power-cpu-llm probe-generation <model.gguf> <user-text|@file> [--diagnostic-canvas N | --canvas-policy model] [--max-new-tokens N] [--steps N] [--seed N] [--workers N] [--matrix-backend portable|auto|power9-fma|power9-int8|power9-int8x2] [--prefill-backend B] [--split-sockets] [--encoder-chunk N] [--emit-json] [--include-reasoning]"
+        after_help = "Usage: power-cpu-llm probe-generation <model.gguf> <user-text|@file> [--diagnostic-canvas N | --canvas-policy model] [--max-new-tokens N] [--steps N] [--seed N] [--workers N] [--matrix-backend portable|auto|power9-fma|power9-int8|power9-int8x2] [--prefill-backend B] [--split-sockets] [--encoder-chunk N] [--emit-json] [--include-reasoning] [--draft-model mtp.gguf] [--draft-max N]"
     )]
     ProbeGeneration(Diagnostic),
     /// Print GGUF metadata and tensor inventory
@@ -109,6 +112,18 @@ enum Command {
         after_help = "Usage: power-cpu-llm trace-long-context <model.gguf> <long-context-fixture-dir> <NEW-output-directory> [--workers N] [--matrix-backend portable|auto|power9-fma|power9-int8|power9-int8x2]"
     )]
     TraceLongContext(Diagnostic),
+    /// Reference hybrid-model forward pass (Nemotron 3.5, Qwen 3.5/3.6) over token IDs (top next-token logits)
+    #[command(
+        name = "hybrid-logits",
+        after_help = "Usage: power-cpu-llm hybrid-logits <model.gguf> <token-id,token-id,...|text:TEXT> [--workers N] [--matrix-backend portable|auto|power9-fma|power9-int8|power9-int8x2] [--trace NEW-directory]"
+    )]
+    HybridLogits(Diagnostic),
+    /// Greedy hybrid-model chat completion of one user message (Nemotron 3.5, Qwen 3.5/3.6)
+    #[command(
+        name = "hybrid-chat",
+        after_help = "Usage: power-cpu-llm hybrid-chat <model.gguf> <user-text|@file> [--max-new-tokens N] [--think on|off] [--workers N] [--matrix-backend portable|auto|power9-fma|power9-int8|power9-int8x2]"
+    )]
+    HybridChat(Diagnostic),
     /// Print the DiffusionGemma denoising configuration
     #[command(
         name = "diffusion-config",
@@ -151,6 +166,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         Command::TraceFullCanvas(d) => ("trace-full-canvas", d.args),
         Command::TracePrompt(d) => ("trace-prompt", d.args),
         Command::TraceLongContext(d) => ("trace-long-context", d.args),
+        Command::HybridLogits(d) => ("hybrid-logits", d.args),
+        Command::HybridChat(d) => ("hybrid-chat", d.args),
         Command::DiffusionConfig(d) => ("diffusion-config", d.args),
         Command::Bench(d) => ("bench", d.args),
     };
@@ -222,6 +239,46 @@ fn diagnostic(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
                 return Err("check-weights requires one GGUF file path".into());
             }
             let model = weights::ModelFile::open(&args[1])?;
+            let inventory = model.inventory();
+            if inventory.architecture() == Some(nemotron::ARCHITECTURE) {
+                let definition = nemotron::ModelDefinition::bind(inventory)?;
+                let count = |kind| {
+                    definition
+                        .spec
+                        .layers
+                        .iter()
+                        .filter(|&&k| k == kind)
+                        .count()
+                };
+                println!(
+                    "Bound {}: {} Mamba-2, {} attention and {} MoE layers, {} MTP block(s)",
+                    nemotron::ARCHITECTURE,
+                    count(nemotron::LayerKind::Mamba),
+                    count(nemotron::LayerKind::Attention),
+                    count(nemotron::LayerKind::Moe),
+                    definition.spec.mtp_layers
+                );
+            } else if inventory.architecture() == Some(qwen35::ARCHITECTURE) {
+                let definition = qwen35::ModelDefinition::bind(inventory)?;
+                let count = |kind| {
+                    definition
+                        .spec
+                        .layers
+                        .iter()
+                        .filter(|&&k| k == kind)
+                        .count()
+                };
+                println!(
+                    "Bound {}: {} Gated DeltaNet and {} attention layers (each with MoE), {} MTP block(s)",
+                    qwen35::ARCHITECTURE,
+                    count(qwen35::LayerKind::Linear),
+                    count(qwen35::LayerKind::Attention),
+                    definition.spec.mtp_layers
+                );
+            } else {
+                model::ModelDefinition::bind(inventory)?;
+                println!("Bound {}", inventory.architecture().unwrap_or("?"));
+            }
             let mut checked = 0;
             let mut checksum = 0.0_f64;
             for tensor in &model.inventory().tensors {
@@ -386,6 +443,8 @@ fn diagnostic(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
             }
             generate::probe_generation(&args[1], &args[2], &args[3..])
         }
+        Some("hybrid-logits") => nemotron_cli::logits(&args[1..]),
+        Some("hybrid-chat") => nemotron_cli::chat(&args[1..]),
         Some("diffusion-config") => {
             if args.len() != 1 {
                 return Err("diffusion-config takes no arguments".into());

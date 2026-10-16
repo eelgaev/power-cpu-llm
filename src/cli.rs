@@ -3,6 +3,7 @@
 pub(crate) mod full_canvas;
 pub(crate) mod generate;
 pub(crate) mod long_context;
+pub(crate) mod nemotron;
 pub(crate) mod probe;
 pub(crate) mod profile;
 pub(crate) mod prompt_trace;

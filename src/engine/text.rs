@@ -138,6 +138,10 @@ impl TraceError<std::convert::Infallible> {
     }
 }
 
+/// Chooses how many leading positions of a speculative pass stay cached,
+/// from its final-normed rows (see [`ReferenceText::encode_speculative`]).
+pub type KeepRows<'k> = dyn FnMut(&[Vec<f32>]) -> Result<usize, Error> + 'k;
+
 pub struct EncoderCache<'a> {
     file: &'a ModelFile,
     model: &'a ModelDefinition<'a>,
@@ -453,7 +457,14 @@ impl<'a> ReferenceText<'a> {
     pub fn matrix_backend(&self) -> &'static str {
         self.kernels.name()
     }
-    fn compute(&self) -> crate::engine::execution::Compute<'_> {
+    /// The target's file and bindings (for a drafter).
+    pub fn file(&self) -> &'a ModelFile {
+        self.file
+    }
+    pub fn model(&self) -> &'a ModelDefinition<'a> {
+        self.model
+    }
+    pub fn compute(&self) -> crate::engine::execution::Compute<'_> {
         crate::engine::execution::Compute {
             workers: self.workers.as_deref(),
             kernels: self.kernels,
@@ -689,6 +700,33 @@ impl<'a> ReferenceText<'a> {
         cache: &mut EncoderCache<'a>,
         observer: &mut impl FnMut(TracePoint, &[Vec<f32>]) -> Result<(), E>,
     ) -> Result<Vec<Vec<f32>>, TraceError<E>> {
+        self.encode_keeping(tokens, cache, observer, &mut |rows| Ok(rows.len()))
+    }
+    /// Speculative verification: encodes `tokens` causally, then
+    /// `keep(final-normed rows)` chooses how many leading positions stay in
+    /// the cache (1 to all); the rest of the pass is dropped as if never run.
+    /// An error from `keep` rolls the whole pass back.
+    pub fn encode_speculative(
+        &self,
+        tokens: &[u32],
+        cache: &mut EncoderCache<'a>,
+        keep: &mut KeepRows<'_>,
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        self.encode_keeping(
+            tokens,
+            cache,
+            &mut |_, _| Ok::<_, std::convert::Infallible>(()),
+            keep,
+        )
+        .map_err(TraceError::compute)
+    }
+    fn encode_keeping<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut EncoderCache<'a>,
+        observer: &mut impl FnMut(TracePoint, &[Vec<f32>]) -> Result<(), E>,
+        keep: &mut KeepRows<'_>,
+    ) -> Result<Vec<Vec<f32>>, TraceError<E>> {
         self.check_tokens(tokens, cache, false)?;
         // One-token steps run one worker per core (see Workers::one_per_core).
         let _cap = self
@@ -734,10 +772,15 @@ impl<'a> ReferenceText<'a> {
             observer(TracePoint::EncoderFinal, &normalized).map_err(TraceError::Observer)?;
             Ok(normalized)
         };
-        let outcome = run();
+        let outcome = run().and_then(|normalized| match keep(&normalized) {
+            Ok(n) if (1..=tokens.len()).contains(&n) => Ok((normalized, n)),
+            Ok(_) => Err(Error::Shape("speculative keep count").into()),
+            Err(e) => Err(e.into()),
+        });
         match outcome {
-            Ok(normalized) => {
-                for layer in &mut cache.layers {
+            Ok((normalized, n)) => {
+                for (layer, step) in cache.layers.iter_mut().zip(&pending) {
+                    layer.keep(step, n);
                     layer.commit();
                 }
                 Ok(normalized)

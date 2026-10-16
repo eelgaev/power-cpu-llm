@@ -166,18 +166,19 @@ pub struct ModelDefinition<'a> {
     pub layers: Vec<LayerBindings<'a>>,
 }
 
-struct Metadata<'a> {
-    map: &'a BTreeMap<String, MetadataValue>,
+/// Typed metadata reads (shared with [`crate::engine::nemotron`]).
+pub(crate) struct Metadata<'a> {
+    pub(crate) map: &'a BTreeMap<String, MetadataValue>,
     /// Architecture key prefix, e.g. `diffusion-gemma.` or `gemma4.`.
-    prefix: &'static str,
+    pub(crate) prefix: &'static str,
 }
 impl<'a> Metadata<'a> {
-    fn value(&self, key: &str) -> Result<&'a MetadataValue, Error> {
+    pub(crate) fn value(&self, key: &str) -> Result<&'a MetadataValue, Error> {
         self.map
             .get(key)
             .ok_or_else(|| Error(format!("missing metadata: {key}")))
     }
-    fn uint(&self, key: &str) -> Result<usize, Error> {
+    pub(crate) fn uint(&self, key: &str) -> Result<usize, Error> {
         match self.value(key)? {
             MetadataValue::Unsigned(n) => {
                 usize::try_from(*n).map_err(|_| Error(format!("integer overflow: {key}")))
@@ -186,7 +187,7 @@ impl<'a> Metadata<'a> {
         }
     }
     /// Unsigned value, or 0 if the key is absent.
-    fn uint_or_zero(&self, suffix: &str) -> Result<usize, Error> {
+    pub(crate) fn uint_or_zero(&self, suffix: &str) -> Result<usize, Error> {
         let key = format!("{}{suffix}", self.prefix);
         if self.map.contains_key(&key) {
             self.uint(&key)
@@ -195,7 +196,7 @@ impl<'a> Metadata<'a> {
         }
     }
     /// A per-layer count stored as one unsigned value or a signed array.
-    fn per_layer(&self, suffix: &str, count: usize) -> Result<Vec<usize>, Error> {
+    pub(crate) fn per_layer(&self, suffix: &str, count: usize) -> Result<Vec<usize>, Error> {
         let key = format!("{}{suffix}", self.prefix);
         match self.value(&key)? {
             MetadataValue::Unsigned(_) => Ok(vec![self.uint(&key)?; count]),
@@ -211,7 +212,7 @@ impl<'a> Metadata<'a> {
             ))),
         }
     }
-    fn positive(&self, suffix: &str) -> Result<usize, Error> {
+    pub(crate) fn positive(&self, suffix: &str) -> Result<usize, Error> {
         let key = format!("{}{suffix}", self.prefix);
         let n = self.uint(&key)?;
         if n == 0 {
@@ -219,7 +220,7 @@ impl<'a> Metadata<'a> {
         }
         Ok(n)
     }
-    fn float(&self, suffix: &str) -> Result<f32, Error> {
+    pub(crate) fn float(&self, suffix: &str) -> Result<f32, Error> {
         let key = format!("{}{suffix}", self.prefix);
         match self.value(&key)? {
             MetadataValue::Float(n)
@@ -230,25 +231,25 @@ impl<'a> Metadata<'a> {
             _ => Err(Error(format!("expected positive finite float: {key}"))),
         }
     }
-    fn boolean(&self, key: &str) -> Result<bool, Error> {
+    pub(crate) fn boolean(&self, key: &str) -> Result<bool, Error> {
         match self.value(key)? {
             MetadataValue::Bool(b) => Ok(*b),
             _ => Err(Error(format!("expected boolean: {key}"))),
         }
     }
-    fn string(&self, key: &str) -> Result<&'a str, Error> {
+    pub(crate) fn string(&self, key: &str) -> Result<&'a str, Error> {
         match self.value(key)? {
             MetadataValue::String(s) => Ok(s),
             _ => Err(Error(format!("expected string: {key}"))),
         }
     }
-    fn array(&self, key: &str) -> Result<&'a ArrayValues, Error> {
+    pub(crate) fn array(&self, key: &str) -> Result<&'a ArrayValues, Error> {
         match self.value(key)? {
             MetadataValue::Array { values, .. } => Ok(values),
             _ => Err(Error(format!("expected array: {key}"))),
         }
     }
-    fn strings(&self, key: &str) -> Result<&'a [String], Error> {
+    pub(crate) fn strings(&self, key: &str) -> Result<&'a [String], Error> {
         match self.array(key)? {
             ArrayValues::String(v) => Ok(v),
             _ => Err(Error(format!("expected string array: {key}"))),
@@ -371,12 +372,13 @@ impl Specification {
     }
 }
 
-struct Registry<'a> {
+/// Tensor bindings by exact name and shape; every tensor must be bound.
+pub(crate) struct Registry<'a> {
     tensors: BTreeMap<&'a str, &'a TensorInfo>,
     used: BTreeSet<&'a str>,
 }
 impl<'a> Registry<'a> {
-    fn new(inventory: &'a Inventory) -> Result<Self, Error> {
+    pub(crate) fn new(inventory: &'a Inventory) -> Result<Self, Error> {
         let mut tensors = BTreeMap::new();
         for tensor in &inventory.tensors {
             if tensors.insert(tensor.name.as_str(), tensor).is_some() {
@@ -388,7 +390,7 @@ impl<'a> Registry<'a> {
             used: BTreeSet::new(),
         })
     }
-    fn bind(
+    pub(crate) fn bind(
         &mut self,
         name: &str,
         shape: [usize; 4],
@@ -424,13 +426,31 @@ impl<'a> Registry<'a> {
         self.used.insert(tensor.name.as_str());
         Ok(tensor)
     }
-    fn has(&self, name: &str) -> bool {
+    /// Fails if any tensor of the file was left unbound.
+    pub(crate) fn finish(&self) -> Result<(), Error> {
+        if self.used.len() != self.tensors.len() {
+            let extra: Vec<_> = self
+                .tensors
+                .keys()
+                .filter(|name| !self.used.contains(**name))
+                .copied()
+                .collect();
+            return Err(Error(format!("unsupported/unbound tensors: {extra:?}")));
+        }
+        Ok(())
+    }
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }
-    fn vector(&mut self, name: &str, width: usize) -> Result<&'a TensorInfo, Error> {
+    pub(crate) fn vector(&mut self, name: &str, width: usize) -> Result<&'a TensorInfo, Error> {
         self.bind(name, [width, 1, 1, 1], true)
     }
-    fn mlp(&mut self, prefix: &str, hidden: usize, ff: usize) -> Result<MlpBindings<'a>, Error> {
+    pub(crate) fn mlp(
+        &mut self,
+        prefix: &str,
+        hidden: usize,
+        ff: usize,
+    ) -> Result<MlpBindings<'a>, Error> {
         Ok(MlpBindings {
             gate: self.bind(&format!("{prefix}gate.weight"), [hidden, ff, 1, 1], false)?,
             up: self.bind(&format!("{prefix}up.weight"), [hidden, ff, 1, 1], false)?,
@@ -611,15 +631,7 @@ impl<'a> ModelDefinition<'a> {
                 decoder_scale,
             });
         }
-        if registry.used.len() != registry.tensors.len() {
-            let extra: Vec<_> = registry
-                .tensors
-                .keys()
-                .filter(|name| !registry.used.contains(**name))
-                .copied()
-                .collect();
-            return Err(Error(format!("unsupported/unbound tensors: {extra:?}")));
-        }
+        registry.finish()?;
         Ok(Self {
             spec,
             vocabulary,

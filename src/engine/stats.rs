@@ -17,6 +17,10 @@ pub enum Stage {
     ExpertCombine,
     SoftEmbedding,
     Logits,
+    /// Mamba-2 input and output projections (Nemotron).
+    MambaProjections,
+    /// Mamba-2 convolution, scan and gated norm (Nemotron).
+    MambaScan,
     /// Nested diagnostics (overlap the stages above): main-thread time in
     /// dense-projection activation quantization and in its worker phase.
     ProjectionQuantize,
@@ -24,8 +28,11 @@ pub enum Stage {
     /// Weight packing on first use (summed over threads, so it can exceed
     /// wall time).
     ProjectionPack,
+    /// One-token routed experts: the gate/up and the down submissions.
+    ExpertsUp,
+    ExpertsDown,
 }
-const STAGES: [(Stage, &str); 12] = [
+const STAGES: [(Stage, &str); 16] = [
     (
         Stage::AttentionProjections,
         "attention q/k/v projections + rope",
@@ -40,7 +47,9 @@ const STAGES: [(Stage, &str); 12] = [
     (Stage::Experts, "routed experts"),
     (Stage::ExpertCombine, "expert accumulation + combine"),
     (Stage::SoftEmbedding, "self-conditioning soft embedding"),
-    (Stage::Logits, "tied output head"),
+    (Stage::Logits, "output head"),
+    (Stage::MambaProjections, "mamba in/out projections"),
+    (Stage::MambaScan, "mamba conv/scan/gated norm"),
     (
         Stage::ProjectionQuantize,
         "(nested) projection quantization",
@@ -50,8 +59,10 @@ const STAGES: [(Stage, &str); 12] = [
         Stage::ProjectionPack,
         "(nested, thread-summed) weight packing",
     ),
+    (Stage::ExpertsUp, "(nested) one-token experts gate/up"),
+    (Stage::ExpertsDown, "(nested) one-token experts down"),
 ];
-static TOTALS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static TOTALS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
 /// Adds its lifetime to `stage` on drop; while it lives, pool submissions
 /// from this thread are attributed to it (outermost non-nested stage).

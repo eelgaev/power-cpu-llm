@@ -1,6 +1,7 @@
 //! Standalone Rust engine. Model parsing and kernel execution are separate
 //! boundaries; ggml is not used as an execution runtime.
 
+pub mod assistant;
 pub mod attention;
 pub mod chat;
 pub mod completion;
@@ -8,8 +9,10 @@ pub mod diffusion;
 pub mod execution;
 pub mod generation;
 pub mod model;
+pub mod nemotron;
 pub mod operators;
 pub mod output;
+pub mod qwen35;
 pub mod stats;
 pub mod text;
 pub mod tokenizer;

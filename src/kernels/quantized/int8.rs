@@ -266,7 +266,7 @@ impl TwoPlaneWriter<'_> {
     /// Quantization blocks of a row.
     pub fn blocks(&self) -> usize {
         let block = match self.encoding {
-            Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0 => 256,
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0 => 256,
             _ => 32,
         };
         self.cols / block
@@ -290,7 +290,7 @@ impl TwoPlaneWriter<'_> {
         // SAFETY: per the contract above; C bounds-checks the range.
         status(unsafe {
             quantize_range_fn()(
-                self.encoding as c_int,
+                kernel_kind(self.encoding),
                 self.pointers.as_ptr(),
                 self.cols,
                 b0,
@@ -329,7 +329,7 @@ impl PlanesWriter<'_> {
     /// Quantization blocks of a row.
     pub fn blocks(&self) -> usize {
         let block = match self.encoding {
-            Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0 => 256,
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0 => 256,
             _ => 32,
         };
         self.cols / block
@@ -383,7 +383,7 @@ impl PlanesWriter<'_> {
             // only blocks [b0, b1) are written (C bounds-checks the range).
             status(unsafe {
                 quantize_range_fn()(
-                    self.encoding as c_int,
+                    kernel_kind(self.encoding),
                     rows.as_ptr(),
                     self.cols,
                     b0,
@@ -662,10 +662,174 @@ pub(super) fn attention_with(
     if ok { Ok(out) } else { Err(E::NonFiniteValue) }
 }
 
-/// Whether `encoding` has an integer-dot kernel (all quantized encodings;
-/// F32 rows always use the F64 kernels).
+/// Whether `encoding` has an integer-dot kernel (the quantized encodings
+/// except Q5_1; F32, F16 and BF16 rows always use the F64 kernels).
 pub fn supports(encoding: Encoding) -> bool {
-    !matches!(encoding, Encoding::F32 | Encoding::F16)
+    !matches!(encoding, Encoding::F32 | Encoding::F16 | Encoding::BF16)
+}
+
+/// The C kernels' encoding for `encoding`: Q5_1 runs as Q5_0 and Q5_K as
+/// Q6_K (see [`split_offsets`]); activations are laid out identically.
+fn kernel_kind(encoding: Encoding) -> c_int {
+    (match encoding {
+        Encoding::Q5_1 => Encoding::Q5_0,
+        Encoding::Q5K => Encoding::Q6K,
+        other => other,
+    }) as c_int
+}
+
+/// Encodings the kernels run as another encoding plus per-32-element offsets:
+/// (the other encoding's bytes, offsets transposed to `[cols / 32][rows]` so
+/// that [`add_offsets`] streams them across rows).
+fn split_offsets(encoding: Encoding, bytes: &[u8], cols: usize) -> Option<(Vec<u8>, Vec<f32>)> {
+    let (bytes, offsets) = match encoding {
+        Encoding::Q5_1 => split_q5_1(bytes),
+        Encoding::Q5K => split_q5_k(bytes),
+        _ => return None,
+    };
+    let nb = cols / 32;
+    let rows = offsets.len() / nb;
+    let mut transposed = vec![0.0f32; offsets.len()];
+    for (r, row) in offsets.chunks_exact(nb).enumerate() {
+        for (j, &o) in row.iter().enumerate() {
+            transposed[j * rows + r] = o;
+        }
+    }
+    Some((bytes, transposed))
+}
+
+/// Q5_K blocks (per 32 values `d sc q - dmin m`, q in 0..31) as Q6_K blocks
+/// (per 16 values `d sc (q6 - 32)`) with `q6 = q + 32`, the same `d` and each
+/// 32-value scale for both of its 16-value halves (exact), plus the offset
+/// `-dmin m` of every 32 values. Returns the Q6_K bytes and the offsets.
+pub(crate) fn split_q5_k(bytes: &[u8]) -> (Vec<u8>, Vec<f32>) {
+    use crate::kernels::portable::dequant::half;
+    let blocks = bytes.len() / 176;
+    let mut q6 = Vec::with_capacity(blocks * 210);
+    let mut offsets = Vec::with_capacity(blocks * 8);
+    for block in bytes.as_chunks::<176>().0 {
+        let (dmin, scales) = (half(&block[2..]), &block[4..16]);
+        let (high, low) = (&block[16..48], &block[48..]);
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+        let mut sc = [0i8; 16];
+        for g in 0..8 {
+            let (scale, min) = if g < 4 {
+                (scales[g] & 63, scales[g + 4] & 63)
+            } else {
+                (
+                    (scales[g + 4] & 15) | ((scales[g - 4] >> 6) << 4),
+                    (scales[g + 4] >> 4) | ((scales[g] >> 6) << 4),
+                )
+            };
+            offsets.push(-(dmin * f32::from(min)));
+            // Q6_K element e = half * 128 + k * 32 + l uses scale
+            // half * 8 + 2k + l / 16.
+            let (h, k) = (g / 4, g % 4);
+            sc[h * 8 + 2 * k] = scale as i8;
+            sc[h * 8 + 2 * k + 1] = scale as i8;
+            for l in 0..32 {
+                let packed = low[(g / 2) * 32 + l];
+                let nibble = if g % 2 == 0 { packed & 15 } else { packed >> 4 };
+                let q = (nibble | ((high[l] >> g) & 1) << 4) + 32;
+                let at = h * 64 + l + if k % 2 == 1 { 32 } else { 0 };
+                ql[at] |= if k < 2 { q & 15 } else { (q & 15) << 4 };
+                qh[h * 32 + l] |= (q >> 4) << (2 * k);
+            }
+        }
+        q6.extend_from_slice(&ql);
+        q6.extend_from_slice(&qh);
+        q6.extend(sc.iter().map(|&x| x as u8));
+        q6.extend_from_slice(&block[..2]);
+    }
+    (q6, offsets)
+}
+
+/// Q5_1 blocks (`d * q + m`) as Q5_0 blocks (`d * (q - 16)`: the same scale
+/// and five-bit values) plus a per-block offset `m + 16 d`, so that
+/// `sum((d q + m) x) = (Q5_0 dot) + offset * sum(x)`. Returns the Q5_0 bytes
+/// and the offsets in block order (`[rows][blocks]`).
+pub(crate) fn split_q5_1(bytes: &[u8]) -> (Vec<u8>, Vec<f32>) {
+    use crate::kernels::portable::dequant::half;
+    let blocks = bytes.len() / 24;
+    let mut q5_0 = Vec::with_capacity(blocks * 22);
+    let mut offsets = Vec::with_capacity(blocks);
+    for block in bytes.as_chunks::<24>().0 {
+        q5_0.extend_from_slice(&block[..2]);
+        q5_0.extend_from_slice(&block[4..]);
+        offsets.push(half(&block[2..]) + 16.0 * half(block));
+    }
+    (q5_0, offsets)
+}
+
+/// Adds `offsets[b][row0 + r] * sum(x[p][block b])` (offsets `[blocks][rows]`)
+/// to `out[p * out_stride + out_offset + r]` for `r` in `0..count`,
+/// with `x` the quantized activations of `input` (`da * a`, 32-element
+/// blocks, so the Q5_0 projection plus this is the Q5_1 projection of the
+/// same quantized activations). A nonfinite result is an error, as from
+/// the kernels.
+#[allow(clippy::too_many_arguments)]
+fn add_offsets(
+    offsets: &[f32],
+    rows: usize,
+    row0: usize,
+    count: usize,
+    input: &QuantizedInput,
+    out: &mut [f32],
+    out_stride: usize,
+    out_offset: usize,
+) -> Result<(), Error> {
+    let (cols, nb) = (input.cols, input.cols / 32);
+    let bytes = input.as_bytes();
+    let (_, da_at, s_at) = input.regions(input.positions);
+    let float = |at: usize| f32::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+    // Every position's 32-value block sums first, so each row's offsets are
+    // read once for all positions.
+    let positions = input.positions;
+    let mut sums = vec![0.0f32; positions * nb];
+    for (p, sums) in sums.chunks_exact_mut(nb).enumerate() {
+        let (g, l) = (p / 4, p % 4);
+        if input.encoding == Encoding::Q5K {
+            // K layout: one scale per 256 values (`da[group][block][l]`) and
+            // the quantizer's int16 sum of every 32 values (`s`, see
+            // `pq8_quantize_group_range`).
+            let blocks = cols / 256;
+            for (j, sum) in sums.iter_mut().enumerate() {
+                let (b, sub) = (j / 8, j % 8);
+                let da = float(da_at + ((g * blocks + b) * 4 + l) * 4);
+                let at = s_at + (g * blocks * 32 + ((b * 4 + sub / 2) * 4 + l) * 2 + sub % 2) * 2;
+                let a = i16::from_ne_bytes([bytes[at], bytes[at + 1]]);
+                *sum = da * f32::from(a);
+            }
+            continue;
+        }
+        // Group g: [4][cols * 4] bytes (each 4-element chunk 4 times).
+        let q = &bytes[g * 16 * cols + l * cols * 4..][..cols * 4];
+        for (b, sum) in sums.iter_mut().enumerate() {
+            let a: i32 = (0..32)
+                .map(|i| i32::from(q[b * 128 + (i / 4) * 16 + i % 4] as i8))
+                .sum();
+            *sum = float(da_at + ((g * nb + b) * 4 + l) * 4) * a as f32;
+        }
+    }
+    // Block by block across the rows: contiguous multiply-adds (vectorized),
+    // each offset column read once for every position.
+    for j in 0..nb {
+        let column = &offsets[j * rows + row0..][..count];
+        for p in 0..positions {
+            let sum = sums[p * nb + j];
+            let dst = &mut out[p * out_stride + out_offset..][..count];
+            for (d, &o) in dst.iter_mut().zip(column) {
+                *d += o * sum;
+            }
+        }
+    }
+    for p in 0..positions {
+        if !crate::kernels::reference::all_finite(&out[p * out_stride + out_offset..][..count]) {
+            return Err(Error::NonFiniteOutput);
+        }
+    }
+    Ok(())
 }
 
 /// Activations `[positions, cols]` quantized for one weight encoding.
@@ -698,7 +862,7 @@ impl QuantizedInput {
             return Err(Error::NonFiniteInput);
         }
         // SAFETY: pure size computation.
-        let len = unsafe { pq8_input_bytes(encoding as c_int, cols, positions) };
+        let len = unsafe { pq8_input_bytes(kernel_kind(encoding), cols, positions) };
         if len == 0 {
             return Err(Error::Shape("columns are not a block multiple"));
         }
@@ -710,7 +874,7 @@ impl QuantizedInput {
         // SAFETY: x is [positions, cols]; storage holds >= len bytes.
         status(unsafe {
             pq8_quantize(
-                encoding as c_int,
+                kernel_kind(encoding),
                 x.as_ptr(),
                 positions,
                 cols,
@@ -748,7 +912,7 @@ impl QuantizedInput {
             ));
         }
         // SAFETY: pure size computation.
-        let len = unsafe { pq8_input_bytes(encoding as c_int, cols, positions) };
+        let len = unsafe { pq8_input_bytes(kernel_kind(encoding), cols, positions) };
         if len == 0 {
             return Err(Error::Shape("columns are not a block multiple"));
         }
@@ -927,7 +1091,7 @@ impl QuantizedInput {
         let dst = out.regions(positions.len());
         let q_row = 4 * self.cols;
         // A missing row's stored bytes: a = 0 (Q6_K stores a + 128).
-        let zero = if self.encoding == Encoding::Q6K {
+        let zero = if kernel_kind(self.encoding) == Encoding::Q6K as c_int {
             0x80u8
         } else {
             0
@@ -979,7 +1143,7 @@ impl QuantizedInput {
     /// Blocks per row and int16 sums per (group, block).
     fn block_layout(&self) -> (usize, usize) {
         let (block, k_type) = match self.encoding {
-            Encoding::Q4K | Encoding::Q6K => (256, true),
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K => (256, true),
             Encoding::TQ2_0 => (256, false),
             _ => (32, false),
         };
@@ -999,7 +1163,7 @@ impl QuantizedInput {
         // shared input through this API must restore the ordinary projection.
         self.shared_scale = false;
         let (block, k_type) = match self.encoding {
-            Encoding::Q4K | Encoding::Q6K => (256, true),
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q6K => (256, true),
             Encoding::TQ2_0 => (256, false),
             _ => (32, false),
         };
@@ -1132,7 +1296,7 @@ impl<'a> QuantizeGroup<'a> {
         // q/da/s are this group's exact regions.
         status(unsafe {
             quantize_group_fn()(
-                self.encoding as c_int,
+                kernel_kind(self.encoding),
                 pointers.as_ptr(),
                 self.cols,
                 self.q.as_mut_ptr(),
@@ -1179,7 +1343,7 @@ impl<'a> QuantizeGroup<'a> {
         // regions (s empty and unused for 32-element encodings).
         status(unsafe {
             quantize_group_fn()(
-                self.encoding as c_int,
+                kernel_kind(self.encoding),
                 pointers.as_ptr(),
                 self.cols,
                 self.q.as_mut_ptr(),
@@ -1222,14 +1386,17 @@ pub(super) fn project_with(
     } else {
         kernel
     };
-    // SAFETY: weights are exactly rows * row_bytes (checked at construction),
-    // input holds `len` bytes for (encoding, cols, positions), out is
-    // [positions, rows] with stride rows; C retains nothing.
+    let split = split_offsets(weights.encoding, weights.bytes, weights.cols);
+    let bytes = split.as_ref().map_or(weights.bytes, |(q, _)| q.as_slice());
+    // SAFETY: weights are exactly rows * row_bytes (checked at construction;
+    // a Q5_1 split keeps the rows as Q5_0), input holds `len` bytes for
+    // (encoding, cols, positions), out is [positions, rows] with stride rows;
+    // C retains nothing.
     status(unsafe {
         kernel(
-            weights.encoding as c_int,
-            weights.bytes.as_ptr(),
-            weights.bytes.len(),
+            kernel_kind(weights.encoding),
+            bytes.as_ptr(),
+            bytes.len(),
             weights.rows,
             weights.cols,
             input.storage.as_ptr().cast(),
@@ -1239,7 +1406,20 @@ pub(super) fn project_with(
             weights.rows,
             0,
         )
-    })
+    })?;
+    if let Some((_, offsets)) = &split {
+        add_offsets(
+            offsets,
+            weights.rows,
+            0,
+            weights.rows,
+            input,
+            out,
+            weights.rows,
+            0,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "power9", target_arch = "powerpc64"))]
@@ -1308,6 +1488,12 @@ pub struct PackedRows {
         allow(dead_code)
     )]
     storage: Vec<u128>,
+    /// Q5_1 only (packed as Q5_0): the block offsets of [`split_q5_1`].
+    #[cfg_attr(
+        not(all(feature = "power9", target_arch = "powerpc64")),
+        allow(dead_code)
+    )]
+    offsets: Vec<f32>,
 }
 
 impl PackedRows {
@@ -1328,9 +1514,16 @@ pub(super) fn pack_power9(weights: &EncodedRows<'_>) -> Result<PackedRows, Error
     if !supports(weights.encoding) {
         return Err(Error::Shape("integer-dot packing of F32 weights"));
     }
+    let kind = kernel_kind(weights.encoding);
+    let (bytes, offsets) =
+        split_offsets(weights.encoding, weights.bytes, weights.cols).unwrap_or_default();
+    let bytes = if offsets.is_empty() {
+        weights.bytes
+    } else {
+        &bytes
+    };
     // SAFETY: pure size computation.
-    let len =
-        unsafe { pq8_packed_bytes_power9(weights.encoding as c_int, weights.rows, weights.cols) };
+    let len = unsafe { pq8_packed_bytes_power9(kind, weights.rows, weights.cols) };
     if len == 0 {
         return Err(Error::Shape("columns are not a block multiple"));
     }
@@ -1343,9 +1536,9 @@ pub(super) fn pack_power9(weights: &EncodedRows<'_>) -> Result<PackedRows, Error
     // storage holds len bytes, 16-byte aligned; C retains nothing.
     status(unsafe {
         pq8_pack_power9(
-            weights.encoding as c_int,
-            weights.bytes.as_ptr(),
-            weights.bytes.len(),
+            kind,
+            bytes.as_ptr(),
+            bytes.len(),
             weights.rows,
             weights.cols,
             0,
@@ -1360,6 +1553,7 @@ pub(super) fn pack_power9(weights: &EncodedRows<'_>) -> Result<PackedRows, Error
         cols: weights.cols,
         len,
         storage,
+        offsets,
     })
 }
 
@@ -1388,16 +1582,47 @@ pub(super) fn project_packed_power9(
     if out_offset + count > out_stride || needed.is_none_or(|n| n > out.len()) {
         return Err(Error::Shape("output stride/offset"));
     }
+    if k_decode(packed, input) {
+        project_k_decode(packed, row0, count, input, out, out_stride, out_offset)?;
+    } else {
+        project_packed_native(packed, row0, count, input, out, out_stride, out_offset)?;
+    }
+    if !packed.offsets.is_empty() {
+        add_offsets(
+            &packed.offsets,
+            packed.rows,
+            row0,
+            count,
+            input,
+            out,
+            out_stride,
+            out_offset,
+        )?;
+    }
+    Ok(())
+}
+
+/// The frozen C kernel (every encoding and batch).
+#[cfg(all(feature = "power9", target_arch = "powerpc64"))]
+fn project_packed_native(
+    packed: &PackedRows,
+    row0: usize,
+    count: usize,
+    input: &QuantizedInput,
+    out: &mut [f32],
+    out_stride: usize,
+    out_offset: usize,
+) -> Result<(), Error> {
     // SAFETY: packed holds len bytes from pq8_pack_power9 for these
     // (encoding, rows, cols); input holds `len` bytes for (encoding, cols,
-    // positions); every written index is inside out (checked above).
+    // positions); every written index is inside out (checked by the caller).
     status(unsafe {
         (if input.shared_scale {
             pq8_shared_project_packed_power9
         } else {
             pq8_project_packed_power9
         })(
-            packed.encoding as c_int,
+            kernel_kind(packed.encoding),
             packed.storage.as_ptr().cast(),
             packed.len,
             packed.rows,
@@ -1412,6 +1637,102 @@ pub(super) fn project_packed_power9(
             out_offset,
         )
     })
+}
+
+/// Whether one-token K-quant rows take the hand-written decode tiles
+/// (`POWER_LLM_K_TILE=0` keeps the frozen C kernel, for comparison).
+#[cfg(all(feature = "power9", target_arch = "powerpc64"))]
+fn k_decode(packed: &PackedRows, input: &QuantizedInput) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kind = kernel_kind(packed.encoding);
+    input.positions == 2
+        && !input.shared_scale
+        && (kind == 12 || kind == 14)
+        && packed.rows >= 16
+        && *ON.get_or_init(|| std::env::var("POWER_LLM_K_TILE").map_or(true, |v| v != "0"))
+}
+
+/// Rows `[row0, row0 + count)` of one-token K-quant `packed` through the
+/// decode tiles, one packed super-group (16 rows) per tile; rows outside the
+/// range are computed and dropped. Same values and nonfinite-output status
+/// as the frozen kernel.
+#[cfg(all(feature = "power9", target_arch = "powerpc64"))]
+fn project_k_decode(
+    packed: &PackedRows,
+    row0: usize,
+    count: usize,
+    input: &QuantizedInput,
+    out: &mut [f32],
+    out_stride: usize,
+    out_offset: usize,
+) -> Result<(), Error> {
+    use super::tile_k_decode::{KTileArgs, pq8_q4_k_tile4x2_power9, pq8_q6_k_tile4x2_power9};
+    const CHUNK: usize = 8;
+    let q4k = kernel_kind(packed.encoding) == 12;
+    let cols = packed.cols;
+    let nb = cols / 256;
+    // Tile-major packing: per super-group of 4 row groups, nb block records
+    // of 4 groups' block weights then their 4 metadata entries.
+    let record = 4 * if q4k { 512 + 224 } else { 1024 + 288 };
+    let super_bytes = nb * record;
+    // Input layout (positions padded to 4): q [4][cols / 4][16], da [nb][4],
+    // then the int16 sub-block sums [nb][4][4][2].
+    let qbytes = 16 * cols;
+    let supers = packed.rows.div_ceil(16);
+    if super_bytes * supers != packed.len || input.len < qbytes + 80 * nb {
+        return Err(Error::Shape("K-quant decode tile layout"));
+    }
+    let base: *const u8 = packed.storage.as_ptr().cast();
+    let q: *const u8 = input.storage.as_ptr().cast();
+    let tile = if q4k {
+        pq8_q4_k_tile4x2_power9
+    } else {
+        pq8_q6_k_tile4x2_power9
+    };
+    let end = row0 + count;
+    let mut finite = true;
+    let mut buffer = [0.0f32; 32 * CHUNK];
+    let mut first = row0 / 16;
+    while first * 16 < end {
+        let tiles = (end.div_ceil(16) - first).min(CHUNK);
+        let args = KTileArgs {
+            // SAFETY (all pointer offsets): first + tiles <= supers, and
+            // the input offsets are inside `input.len` (checked above).
+            records: unsafe { base.add(first * super_bytes) },
+            tiles,
+            act0: q,
+            act1: unsafe { q.add(4 * cols) },
+            da: unsafe { q.add(qbytes) },
+            sums: unsafe { q.add(qbytes + 16 * nb) },
+            nb,
+            out: buffer.as_mut_ptr(),
+        };
+        // SAFETY: args describe `tiles` complete super-groups of this packed
+        // K-quant matrix and its 2-position input; buffer holds 32 floats per
+        // tile.
+        unsafe { tile(&args) };
+        for (t, values) in buffer.as_chunks::<32>().0.iter().take(tiles).enumerate() {
+            for r in 0..4 {
+                for lane in 0..4 {
+                    let row = 16 * (first + t) + 4 * r + lane;
+                    if row < row0 || row >= end {
+                        continue;
+                    }
+                    for p in 0..2 {
+                        let y = values[8 * r + 4 * p + lane];
+                        finite &= y.is_finite();
+                        out[p * out_stride + out_offset + (row - row0)] = y;
+                    }
+                }
+            }
+        }
+        first += tiles;
+    }
+    if finite {
+        Ok(())
+    } else {
+        Err(Error::NonFiniteOutput)
+    }
 }
 
 #[cfg(test)]

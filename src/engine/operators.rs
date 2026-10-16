@@ -575,6 +575,7 @@ impl SelfConditioner {
 }
 
 mod batch;
+pub(crate) use batch::{ExpertActivation, routed_experts};
 pub use batch::{
     feed_forward_batch, feed_forward_batch_with, feed_forward_batch_with_workers,
     project_streamed_batch, project_streamed_batch_with, project_streamed_batch_with_workers,

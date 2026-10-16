@@ -445,6 +445,16 @@ impl<B: Backend> Runner<B> {
 /// The model kind selects the procedure: diffusion canvases (DiffusionGemma)
 /// or token-by-token sampling (Gemma 4, `autoregressive`); both report the
 /// same events, usage and output.
+/// Speculative decoding totals of a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DraftStats {
+    pub drafted: usize,
+    pub accepted: usize,
+    pub verify_passes: usize,
+    pub draft_seconds: f64,
+    pub verify_seconds: f64,
+}
+
 pub struct GenerationSession<'r, 'a> {
     inner: Inner<'r, 'a>,
 }
@@ -467,6 +477,37 @@ impl<'r, 'a> GenerationSession<'r, 'a> {
             )),
         };
         Ok(Self { inner })
+    }
+    /// Speculative decoding for an autoregressive target: `drafter` proposes
+    /// up to `max_draft` tokens per target pass (see `ArRunner::set_drafter`).
+    /// Diffusion sessions reject it.
+    pub fn set_drafter(
+        &mut self,
+        drafter: &'r crate::engine::assistant::Drafter<'a>,
+        max_draft: usize,
+    ) -> Result<(), Error> {
+        match &mut self.inner {
+            Inner::Autoregressive(r) => {
+                r.set_drafter(drafter, max_draft);
+                Ok(())
+            }
+            Inner::Diffusion(_) => Err(Error::InvalidConfig(
+                "drafting needs an autoregressive model",
+            )),
+        }
+    }
+    /// Speculative decoding totals so far (zeros without a drafter).
+    pub fn draft_stats(&self) -> DraftStats {
+        match &self.inner {
+            Inner::Autoregressive(r) => DraftStats {
+                drafted: r.drafted,
+                accepted: r.drafts_accepted,
+                verify_passes: r.verify_passes,
+                draft_seconds: r.draft_time.as_secs_f64(),
+                verify_seconds: r.verify_time.as_secs_f64(),
+            },
+            Inner::Diffusion(_) => DraftStats::default(),
+        }
     }
     pub fn advance(&mut self) -> Result<Event, Error> {
         match &mut self.inner {

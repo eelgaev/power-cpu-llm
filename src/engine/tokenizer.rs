@@ -327,48 +327,7 @@ impl Tokenizer {
                 None => ids.extend(s.bytes().map(|b| self.byte_ids[b as usize])),
             }
         }
-        out.extend(self.merge(ids));
-    }
-
-    fn merge(&self, mut ids: Vec<u32>) -> Vec<u32> {
-        const NONE: usize = usize::MAX;
-        let n = ids.len();
-        let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
-        let mut next: Vec<usize> = (1..=n).map(|i| if i == n { NONE } else { i }).collect();
-        let mut alive = vec![true; n];
-        // Min-heap on (rank, left position); stale entries are skipped.
-        let mut heap = BinaryHeap::new();
-        let push = |heap: &mut BinaryHeap<_>, ids: &[u32], left: usize, right: usize| {
-            if let Some(&(rank, merged)) = self.merges.get(&(ids[left], ids[right])) {
-                heap.push(Reverse((rank, left, merged)));
-            }
-        };
-        for i in 1..n {
-            push(&mut heap, &ids, i - 1, i);
-        }
-        while let Some(Reverse((rank, left, merged))) = heap.pop() {
-            let right = next[left];
-            if !alive[left]
-                || right == NONE
-                || self.merges.get(&(ids[left], ids[right])) != Some(&(rank, merged))
-            {
-                continue;
-            }
-            ids[left] = merged;
-            alive[right] = false;
-            next[left] = next[right];
-            if next[left] != NONE {
-                prev[next[left]] = left;
-                push(&mut heap, &ids, left, next[left]);
-            }
-            if prev[left] != NONE {
-                push(&mut heap, &ids, prev[left], left);
-            }
-        }
-        ids.into_iter()
-            .zip(alive)
-            .filter_map(|(id, alive)| alive.then_some(id))
-            .collect()
+        out.extend(merge(&self.merges, ids));
     }
 
     /// Rejects the whole call if any ID is out of range, before any output.
@@ -437,6 +396,49 @@ impl Tokenizer {
         flush(&mut run, &mut out);
         Ok(out)
     }
+}
+
+/// Byte-pair encoding of one word: repeatedly apply the lowest-rank adjacent
+/// merge (`(left, right) -> (rank, merged)`), leftmost first.
+pub(crate) fn merge(merges: &HashMap<(u32, u32), (u32, u32)>, mut ids: Vec<u32>) -> Vec<u32> {
+    const NONE: usize = usize::MAX;
+    let n = ids.len();
+    let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+    let mut next: Vec<usize> = (1..=n).map(|i| if i == n { NONE } else { i }).collect();
+    let mut alive = vec![true; n];
+    // Min-heap on (rank, left position); stale entries are skipped.
+    let mut heap = BinaryHeap::new();
+    let push = |heap: &mut BinaryHeap<_>, ids: &[u32], left: usize, right: usize| {
+        if let Some(&(rank, merged)) = merges.get(&(ids[left], ids[right])) {
+            heap.push(Reverse((rank, left, merged)));
+        }
+    };
+    for i in 1..n {
+        push(&mut heap, &ids, i - 1, i);
+    }
+    while let Some(Reverse((rank, left, merged))) = heap.pop() {
+        let right = next[left];
+        if !alive[left]
+            || right == NONE
+            || merges.get(&(ids[left], ids[right])) != Some(&(rank, merged))
+        {
+            continue;
+        }
+        ids[left] = merged;
+        alive[right] = false;
+        next[left] = next[right];
+        if next[left] != NONE {
+            prev[next[left]] = left;
+            push(&mut heap, &ids, left, next[left]);
+        }
+        if prev[left] != NONE {
+            push(&mut heap, &ids, prev[left], left);
+        }
+    }
+    ids.into_iter()
+        .zip(alive)
+        .filter_map(|(id, alive)| alive.then_some(id))
+        .collect()
 }
 
 /// Incremental UTF-8 for streamed `decode_bytes` output: complete characters

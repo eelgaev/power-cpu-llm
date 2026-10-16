@@ -49,9 +49,12 @@ pub(crate) fn layout(kind: c_int) -> Option<(usize, usize)> {
         1 => (1, 2),
         2 => (32, 18),
         6 => (32, 22),
+        7 => (32, 24),
         8 => (32, 34),
         12 => (256, 144),
+        13 => (256, 176),
         14 => (256, 210),
+        30 => (1, 2),
         35 => (256, 66),
         _ => return None,
     })
@@ -67,6 +70,8 @@ pub(crate) fn decode(kind: c_int, input: &[u8], out: &mut [f32]) {
         match kind {
             0 => y[0] = f32::from_bits(u32le(p)),
             1 => y[0] = half(p),
+            // bfloat16: the high half of a binary32, exact.
+            30 => y[0] = f32::from_bits(u32::from(u16le(p)) << 16),
             35 => {
                 // ggml dequantize_row_tq2_0: qs[64] (four 2-bit values per
                 // byte), then d; element (j * 4 + l * 32 + m) = (q - 1) * d.
@@ -110,6 +115,21 @@ pub(crate) fn decode(kind: c_int, input: &[u8], out: &mut [f32]) {
                     y[i] = d * q as f32;
                 }
             }
+            7 => {
+                // ggml dequantize_row_q5_1: d, m, qh, qs[16]; element i uses
+                // bit i of qh; y = q * d + m (the product is exact in binary32).
+                let (d, m) = (half(p), half(&p[2..]));
+                let high = u32le(&p[4..]);
+                for i in 0..32 {
+                    let nibble = u32::from(if i < 16 {
+                        p[8 + i] & 15
+                    } else {
+                        p[8 + i - 16] >> 4
+                    });
+                    let q = nibble | (((high >> i) & 1) << 4);
+                    y[i] = q as f32 * d + m;
+                }
+            }
             12 => {
                 let scales = &p[4..16];
                 let q = &p[16..];
@@ -132,6 +152,36 @@ pub(crate) fn decode(kind: c_int, input: &[u8], out: &mut [f32]) {
                         } else {
                             packed >> 4
                         };
+                        y[group * 32 + i] = ds * f32::from(value) - dm;
+                    }
+                }
+            }
+            13 => {
+                // ggml dequantize_row_q5_K: d, dmin, scales[12] (as Q4_K),
+                // qh[32] (bit g of qh[i] is the high bit of element i of
+                // group g), qs[128].
+                let scales = &p[4..16];
+                let (high, q) = (&p[16..48], &p[48..]);
+                let (d, dmin) = (half(p), half(&p[2..]));
+                for group in 0..8 {
+                    let (scale, min) = if group < 4 {
+                        (scales[group] & 63, scales[group + 4] & 63)
+                    } else {
+                        (
+                            (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
+                            (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+                        )
+                    };
+                    let ds = d * f32::from(scale);
+                    let dm = dmin * f32::from(min);
+                    for i in 0..32 {
+                        let packed = q[(group / 2) * 32 + i];
+                        let low = if group % 2 == 0 {
+                            packed & 15
+                        } else {
+                            packed >> 4
+                        };
+                        let value = low | ((high[i] >> group) & 1) << 4;
                         y[group * 32 + i] = ds * f32::from(value) - dm;
                     }
                 }

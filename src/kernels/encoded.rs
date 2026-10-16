@@ -11,11 +11,18 @@ pub enum Encoding {
     F16 = 1,
     Q4_0 = 2,
     Q5_0 = 6,
+    /// 32 values q * d + m, q in 0..31 (Nemotron 3.5 experts); exact paths only.
+    Q5_1 = 7,
     Q8_0 = 8,
     Q4K = 12,
+    /// 256 values `d * sc * q - dmin * m`, q in 0..31 (Q4_K plus a high
+    /// bit); exact paths only.
+    Q5K = 13,
     Q6K = 14,
     /// Ternary: 256 values (q - 1) * d, q in 0..3 (E2B mobile MLPs).
     TQ2_0 = 35,
+    /// bfloat16; exact paths only.
+    BF16 = 30,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +59,11 @@ impl TryFrom<i32> for Encoding {
             35 => Ok(Self::TQ2_0),
             2 => Ok(Self::Q4_0),
             6 => Ok(Self::Q5_0),
+            7 => Ok(Self::Q5_1),
+            30 => Ok(Self::BF16),
             8 => Ok(Self::Q8_0),
             12 => Ok(Self::Q4K),
+            13 => Ok(Self::Q5K),
             14 => Ok(Self::Q6K),
             _ => Err(Error::UnsupportedType(id)),
         }
@@ -68,8 +78,11 @@ impl Encoding {
             Self::TQ2_0 => (256, 66),
             Self::Q4_0 => (32, 18),
             Self::Q5_0 => (32, 22),
+            Self::Q5_1 => (32, 24),
+            Self::BF16 => (1, 2),
             Self::Q8_0 => (32, 34),
             Self::Q4K => (256, 144),
+            Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
         }
     }
@@ -168,6 +181,23 @@ mod tests {
             let nibble = if i < 16 { 2 } else { 7 };
             assert_eq!(x, (nibble + high - 16) as f32);
         }
+    }
+
+    #[test]
+    fn q5_1_adds_the_block_minimum_and_bf16_is_the_high_half() {
+        let mut bytes = vec![0; 24];
+        bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes()); // d=1
+        bytes[2..4].copy_from_slice(&0xb800_u16.to_le_bytes()); // m=-0.5
+        bytes[4..8].copy_from_slice(&((1u32 << 1) | (1u32 << 30)).to_le_bytes());
+        bytes[8..].fill(0x93);
+        let decoded = Encoding::Q5_1.decode(&bytes, 32).unwrap();
+        for (i, &x) in decoded.iter().enumerate() {
+            let high = if i == 1 || i == 30 { 16 } else { 0 };
+            let nibble = if i < 16 { 3 } else { 9 };
+            assert_eq!(x, (nibble + high) as f32 - 0.5);
+        }
+        let bytes = [0x80, 0x3f, 0x20, 0xc0];
+        assert_eq!(Encoding::BF16.decode(&bytes, 2).unwrap(), [1.0, -2.5]);
     }
 
     #[test]

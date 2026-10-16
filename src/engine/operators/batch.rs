@@ -428,6 +428,10 @@ const FUSE_MAX_POSITIONS: usize = 8;
 /// one-token decode (26B: 0.111 s/token at 32 rows, 0.105 at 128).
 /// Fused one-token projection items per worker (see `project_many`).
 const FUSE_ITEMS_PER_WORKER: usize = 1;
+/// One-token expert items per worker: finer items cut the tail when one
+/// core streams slower (8 cores: Qwen3.6 experts 20.9 -> 20.0 ms per token,
+/// Gemma 4 26B 16.9 -> 17.0 tok/s; 16 is equal, 32 slower).
+const EXPERT_ITEMS_PER_WORKER: usize = 8;
 
 /// Whole matrices projected from the same `input` in ONE worker submission
 /// (one-token decode issues several small projections per stage, each paying
@@ -1321,18 +1325,93 @@ fn experts_chunked(
         .moe
         .as_ref()
         .ok_or(Error::Shape("layer has no routed experts"))?;
-    let gu = moe.expert_gate_up;
-    let down = moe.expert_down;
+    routed_experts(
+        file,
+        moe.expert_gate_up,
+        None,
+        moe.expert_down,
+        ExpertActivation::GeluProduct,
+        groups,
+        expert_input,
+        compute,
+    )
+}
+
+/// The activation between an expert's up and down projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpertActivation {
+    /// Fused gate|up rows: `gelu(gate) * up` (Gemma).
+    GeluProduct,
+    /// `relu(up)^2` (Nemotron).
+    ReluSquared,
+    /// Gate|up rows: `silu(gate) * up` (Qwen 3.5/3.6).
+    SiluProduct,
+}
+impl ExpertActivation {
+    /// Columns `[a, z)` of the down projection's input, from one up row of
+    /// `inner` (the down projection's width) or `2 * inner` values.
+    fn apply(self, up: &[f32], inner: usize, a: usize, z: usize) -> Result<Vec<f32>, Error> {
+        match self {
+            Self::GeluProduct => Ok(math::gelu_product(&up[a..z], &up[inner + a..inner + z])?),
+            Self::SiluProduct => Ok(up[a..z]
+                .iter()
+                .zip(&up[inner + a..inner + z])
+                .map(|(&g, &u)| {
+                    let g = f64::from(g);
+                    (g / (1.0 + crate::libm::exp(-g)) * f64::from(u)) as f32
+                })
+                .collect()),
+            Self::ReluSquared => Ok(up[a..z]
+                .iter()
+                .map(|&v| {
+                    let r = v.max(0.0);
+                    r * r
+                })
+                .collect()),
+        }
+    }
+    fn up_rows(self, inner: u64) -> Option<u64> {
+        match self {
+            Self::GeluProduct | Self::SiluProduct => inner.checked_mul(2),
+            Self::ReluSquared => Some(inner),
+        }
+    }
+}
+
+/// The routed experts `groups` (expert, its `(token, weight)`s) of one
+/// layer, as [`experts_chunked`] for any expert tensors: `gu` `[hidden,
+/// up rows, experts]` (fused gate|up rows, or only the gate rows when the up
+/// rows are the separate `up` of the same shape and encoding), `down`
+/// `[inner, hidden, experts]`. Weights are not applied. Returns
+/// `[group][token][hidden]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn routed_experts(
+    file: &ModelFile,
+    gu: &TensorInfo,
+    up: Option<&TensorInfo>,
+    down: &TensorInfo,
+    activation: ExpertActivation,
+    groups: &[(usize, Vec<(usize, f32)>)],
+    expert_input: &[Vec<f32>],
+    compute: Compute<'_>,
+) -> Result<Vec<Vec<Vec<f32>>>, Error> {
+    // Rows of the (virtual) fused gate|up matrix of one expert.
+    let fused_rows = match up {
+        None => Some(gu.shape[1]),
+        Some(u) if u.shape == gu.shape && u.type_id == gu.type_id => gu.shape[1].checked_mul(2),
+        Some(_) => None,
+    };
     if gu.shape[3] != 1
         || down.shape[3] != 1
         || gu.shape[2] != down.shape[2]
         || groups.iter().any(|(e, _)| *e as u64 >= gu.shape[2])
-        || down.shape[0].checked_mul(2) != Some(gu.shape[1])
+        || activation.up_rows(down.shape[0]) != fused_rows
         || down.shape[1] != gu.shape[0]
     {
         return Err(Error::Shape("batch fused expert dimensions/index"));
     }
-    let gu_rows = usize::try_from(gu.shape[1]).map_err(|_| Error::ResourceLimit)?;
+    let gu_rows =
+        usize::try_from(fused_rows.expect("checked")).map_err(|_| Error::ResourceLimit)?;
     let down_rows = usize::try_from(down.shape[1]).map_err(|_| Error::ResourceLimit)?;
     let half = usize::try_from(down.shape[0]).map_err(|_| Error::ResourceLimit)?;
     if let (Some(workers), [x]) = (compute.workers, expert_input) {
@@ -1349,7 +1428,9 @@ fn experts_chunked(
             return experts_one_token(
                 file,
                 gu,
+                up,
                 down,
+                activation,
                 groups,
                 x,
                 gu_rows,
@@ -1490,7 +1571,27 @@ fn experts_chunked(
         drop(slots);
         Ok(out)
     };
-    let projected = run(gu, gu_rows, &inputs, &quantized, same_inputs)?;
+    let projected = match up {
+        None => run(gu, gu_rows, &inputs, &quantized, same_inputs)?,
+        Some(up) => {
+            // Separate gate and up matrices (same encoding, so the same
+            // quantized inputs), joined into gate|up rows.
+            let gate = run(gu, half, &inputs, &quantized, same_inputs)?;
+            let ups = run(up, half, &inputs, &quantized, same_inputs)?;
+            gate.into_iter()
+                .zip(ups)
+                .map(|(g, u)| {
+                    g.into_iter()
+                        .zip(u)
+                        .map(|(mut g, u)| {
+                            g.extend(u);
+                            g
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+    };
     drop(inputs);
     drop(quantized);
     let pairs: Vec<(usize, usize)> = projected
@@ -1498,12 +1599,21 @@ fn experts_chunked(
         .enumerate()
         .flat_map(|(g, rows)| (0..rows.len()).map(move |t| (g, t)))
         .collect();
-    let halves: Vec<(&[f32], &[f32])> = pairs
-        .iter()
-        .map(|&(g, t)| projected[g][t].split_at(half))
-        .collect();
-    let flat = gelu_products(&halves, compute)?;
-    drop(halves);
+    let flat = match activation {
+        ExpertActivation::GeluProduct => {
+            let halves: Vec<(&[f32], &[f32])> = pairs
+                .iter()
+                .map(|&(g, t)| projected[g][t].split_at(half))
+                .collect();
+            gelu_products(&halves, compute)?
+        }
+        ExpertActivation::ReluSquared | ExpertActivation::SiluProduct => {
+            compute.map_positions(pairs.len(), |i| {
+                let (g, t) = pairs[i];
+                activation.apply(&projected[g][t], half, 0, half)
+            })?
+        }
+    };
     drop(projected);
     let mut products: Vec<Vec<Vec<f32>>> = groups.iter().map(|_| Vec::new()).collect();
     for ((g, _), product) in pairs.into_iter().zip(flat) {
@@ -1656,14 +1766,16 @@ fn even_items(
 /// The routed experts of one token (two-plane integer kernels, packed
 /// weights) in two submissions instead of five: (1) the workers quantize the
 /// token's input, then project every expert's gate/up rows; (2) each worker
-/// forms the GELU products of a block range of one expert and quantizes
+/// forms the activations (GELU products) of a block range of one expert and quantizes
 /// those blocks, then all project the down rows. The same functions on the
 /// same values as `experts_chunked`; outputs written in place.
 #[allow(clippy::too_many_arguments)]
 fn experts_one_token(
     file: &ModelFile,
     gu: &TensorInfo,
+    up: Option<&TensorInfo>,
     down: &TensorInfo,
+    activation: ExpertActivation,
     groups: &[(usize, Vec<(usize, f32)>)],
     x: &[f32],
     gu_rows: usize,
@@ -1711,14 +1823,22 @@ fn experts_one_token(
     let wx = qx.two_plane_writer(&rows_x, &mut rx)?;
     let mut gu_out = zeros::<f32>(cells(experts, gu_rows, usize::MAX)?)?;
     let gu_ptr = SharedOut(gu_out.as_mut_ptr());
+    // Matrices of phase 1: each expert's fused gate|up rows, or (separate
+    // `up`) its gate rows (matrices 0..experts) and its up rows (experts..),
+    // written to the gate and up halves of the expert's output row.
+    let (matrices, rows_per) = match up {
+        None => (experts, gu_rows),
+        Some(_) => (2 * experts, half),
+    };
     let items = even_items(
-        experts,
-        gu_rows,
+        matrices,
+        rows_per,
         workers.count(),
-        FUSE_ITEMS_PER_WORKER * 2,
+        EXPERT_ITEMS_PER_WORKER,
         align,
     );
     let order = order_of(&items);
+    let span = crate::engine::stats::Span::new(crate::engine::stats::Stage::ExpertsUp);
     prepare_then_items(
         workers,
         wx.blocks(),
@@ -1726,13 +1846,22 @@ fn experts_one_token(
         |b0, b1| Ok(unsafe { wx.quantize_blocks(b0, b1) }?),
         &order,
         |i| {
-            let (g, first, len) = items[i];
-            let row0 = (groups[g].0 * gu_rows + first) as u64;
+            let (m, first, len) = items[i];
+            let (g, part) = (m % experts, m / experts);
+            let tensor = if part == 0 {
+                gu
+            } else {
+                up.expect("separate up")
+            };
+            let row0 = (groups[g].0 * rows_per + first) as u64;
+            let at = g * gu_rows + part * half + first;
             // SAFETY: after the barrier; items' output ranges are disjoint.
-            let (input, dst) = unsafe { (wx.input(), gu_ptr.slice(g * gu_rows + first, len)) };
-            project(gu, gu_available, cols, row0, len, input, dst)
+            let (input, dst) = unsafe { (wx.input(), gu_ptr.slice(at, len)) };
+            project(tensor, gu_available, cols, row0, len, input, dst)
         },
     )?;
+    drop(span);
+    let _span = crate::engine::stats::Span::new(crate::engine::stats::Stage::ExpertsDown);
     // (2) GELU products, their quantization, and down.
     let mut products = zeros::<f32>(cells(experts, half, usize::MAX)?)?;
     let mut residual = zeros::<f32>(cells(experts, half, usize::MAX)?)?;
@@ -1764,7 +1893,7 @@ fn experts_one_token(
         experts,
         down_rows,
         workers.count(),
-        FUSE_ITEMS_PER_WORKER * 2,
+        EXPERT_ITEMS_PER_WORKER,
         align,
     );
     let order = order_of(&items);
@@ -1778,7 +1907,7 @@ fn experts_one_token(
                 let b1 = blocks.min(b0 + (u1 - u));
                 let (a, z) = (b0 * element, b1 * element);
                 let row = &gu_out[g * gu_rows..(g + 1) * gu_rows];
-                let product = math::gelu_product(&row[a..z], &row[half + a..half + z])?;
+                let product = activation.apply(row, half, a, z)?;
                 // SAFETY: this range of this expert's products belongs to
                 // this worker alone; then its blocks are quantized here.
                 unsafe {

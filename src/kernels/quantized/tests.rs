@@ -1,14 +1,17 @@
 use super::super::reference::Matrix;
 use super::*;
 
-const ALL: [Encoding; 8] = [
+const ALL: [Encoding; 11] = [
     Encoding::F32,
     Encoding::F16,
+    Encoding::BF16,
     Encoding::TQ2_0,
     Encoding::Q4_0,
     Encoding::Q5_0,
+    Encoding::Q5_1,
     Encoding::Q8_0,
     Encoding::Q4K,
+    Encoding::Q5K,
     Encoding::Q6K,
 ];
 
@@ -46,12 +49,14 @@ fn random_rows(encoding: Encoding, rows: usize, cols: usize, rng: &mut Rng) -> V
             Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q8_0 => {
                 block[..2].copy_from_slice(&rng.half())
             }
-            Encoding::Q4K => {
+            Encoding::Q4K | Encoding::Q5K | Encoding::Q5_1 => {
                 block[..2].copy_from_slice(&rng.half());
                 block[2..4].copy_from_slice(&rng.half());
             }
             Encoding::Q6K => block[208..].copy_from_slice(&rng.half()),
             Encoding::F16 => block.copy_from_slice(&rng.half()),
+            // The high half of a finite binary32 in [-4, 4].
+            Encoding::BF16 => block.copy_from_slice(&(rng.unit() * 4.0).to_le_bytes()[2..]),
             Encoding::TQ2_0 => block[64..].copy_from_slice(&rng.half()),
         }
         out.extend(block);
@@ -79,6 +84,7 @@ fn independent_decode(encoding: Encoding, row: &[u8], cols: usize) -> Vec<f32> {
         match encoding {
             Encoding::F32 => y.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
             Encoding::F16 => y.push(f16(b)),
+            Encoding::BF16 => y.push(f32::from_le_bytes([0, 0, b[0], b[1]])),
             Encoding::TQ2_0 => {
                 // block_tq2_0 { qs[64]; d }: element j*4 + l*32 + m = (q - 1) * d.
                 let d = f16(&b[64..]);
@@ -116,6 +122,19 @@ fn independent_decode(encoding: Encoding, row: &[u8], cols: usize) -> Vec<f32> {
                     y.push(f16(b) * q as f32);
                 }
             }
+            Encoding::Q5_1 => {
+                // block_q5_1 { d; m; qh[4]; qs[16] }: q * d + m.
+                let high = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                for i in 0..32 {
+                    let low = if i < 16 {
+                        b[8 + i] & 15
+                    } else {
+                        b[8 + i - 16] >> 4
+                    };
+                    let q = low as u32 | ((high >> i) & 1) << 4;
+                    y.push(q as f32 * f16(b) + f16(&b[2..]));
+                }
+            }
             Encoding::Q4K => {
                 let (d, dmin, s, q) = (f16(b), f16(&b[2..]), &b[4..16], &b[16..]);
                 for j in 0..8 {
@@ -131,6 +150,26 @@ fn independent_decode(encoding: Encoding, row: &[u8], cols: usize) -> Vec<f32> {
                     for l in 0..32 {
                         let packed = q[(j / 2) * 32 + l];
                         let v = if j % 2 == 0 { packed & 15 } else { packed >> 4 };
+                        y.push(ds * v as f32 - dm);
+                    }
+                }
+            }
+            Encoding::Q5K => {
+                let (d, dmin, s, qh, q) = (f16(b), f16(&b[2..]), &b[4..16], &b[16..48], &b[48..]);
+                for j in 0..8 {
+                    let (sc, m) = if j < 4 {
+                        (s[j] & 63, s[j + 4] & 63)
+                    } else {
+                        (
+                            (s[j + 4] & 15) | ((s[j - 4] >> 6) << 4),
+                            (s[j + 4] >> 4) | ((s[j] >> 6) << 4),
+                        )
+                    };
+                    let (ds, dm) = (d * sc as f32, dmin * m as f32);
+                    for l in 0..32 {
+                        let packed = q[(j / 2) * 32 + l];
+                        let v = if j % 2 == 0 { packed & 15 } else { packed >> 4 };
+                        let v = v | ((qh[l] >> j) & 1) << 4;
                         y.push(ds * v as f32 - dm);
                     }
                 }
@@ -163,9 +202,9 @@ fn independent_decode(encoding: Encoding, row: &[u8], cols: usize) -> Vec<f32> {
 fn shapes(encoding: Encoding) -> [usize; 2] {
     match encoding {
         Encoding::F32 => [37, 96],
-        Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q8_0 => [32, 160],
-        Encoding::Q4K | Encoding::Q6K | Encoding::TQ2_0 => [256, 512],
-        Encoding::F16 => [37, 96],
+        Encoding::Q4_0 | Encoding::Q5_0 | Encoding::Q5_1 | Encoding::Q8_0 => [32, 160],
+        Encoding::Q4K | Encoding::Q5K | Encoding::Q6K | Encoding::TQ2_0 => [256, 512],
+        Encoding::F16 | Encoding::BF16 => [37, 96],
     }
 }
 

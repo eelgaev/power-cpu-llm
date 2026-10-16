@@ -1,6 +1,7 @@
 //! End-to-end text-chat diagnostic. Short-canvas output is real committed
 //! model output, not a validated response quality or serving demonstration.
 use power_cpu_llm::engine::{
+    assistant::Drafter,
     chat::{ChatRequest, ChatTemplate},
     completion::{CompletionAssembler, CompletionFinish},
     diffusion::DenoisingConfig,
@@ -23,6 +24,8 @@ struct ProbeConfig {
     split_sockets: bool,
     emit_json: bool,
     include_reasoning: bool,
+    draft_model: Option<OsString>,
+    draft_max: usize,
 }
 fn config(flags: &[OsString]) -> Result<ProbeConfig, Box<dyn Error>> {
     let mut cfg = GenerationConfig {
@@ -41,6 +44,8 @@ fn config(flags: &[OsString]) -> Result<ProbeConfig, Box<dyn Error>> {
     let mut split_sockets = false;
     let mut emit_json = false;
     let mut include_reasoning = false;
+    let mut draft_model = None;
+    let mut draft_max = 3;
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
@@ -83,6 +88,8 @@ fn config(flags: &[OsString]) -> Result<ProbeConfig, Box<dyn Error>> {
             "--matrix-backend" => backend = Some(super::trace::matrix_backend(value)?),
             "--prefill-backend" => prefill_backend = Some(super::trace::matrix_backend(value)?),
             "--canvas-policy" if value == "model" => cfg.diagnostic_canvas_length = None,
+            "--draft-model" => draft_model = Some(OsString::from(value)),
+            "--draft-max" => draft_max = value.parse()?,
             _ => return Err(format!("unknown probe-generation option {key}").into()),
         }
     }
@@ -104,6 +111,8 @@ fn config(flags: &[OsString]) -> Result<ProbeConfig, Box<dyn Error>> {
         split_sockets,
         emit_json,
         include_reasoning,
+        draft_model,
+        draft_max,
     })
 }
 
@@ -180,7 +189,31 @@ pub(crate) fn probe_generation(
         runtime.matrix_backend(),
         options.backend
     );
+    let draft_file = options
+        .draft_model
+        .as_ref()
+        .map(ModelFile::open)
+        .transpose()?;
+    let drafter = draft_file
+        .as_ref()
+        .map(|f| Drafter::new(f, &file, &model))
+        .transpose()
+        .map_err(|e| format!("drafter: {e}"))?;
     let mut session = GenerationSession::new(&runtime, &prepared.ids, cfg)?;
+    if let Some(drafter) = &drafter {
+        let start = std::time::Instant::now();
+        drafter.prepack(runtime.compute())?;
+        session.set_drafter(drafter, options.draft_max)?;
+        eprintln!(
+            "Drafter: up to {} tokens per pass (packed in {:.1}s).",
+            options.draft_max,
+            start.elapsed().as_secs_f64()
+        );
+    }
+    // Prefill: model ready to the last prompt chunk; decode: the mean
+    // interval between the first and the last committed token.
+    let ready = std::time::Instant::now();
+    let (mut prefilled, mut first_commit, mut last_commit) = (None, None, None);
     let mut generation_error = None;
     while !session.is_finished() {
         let event = match session.advance() {
@@ -196,7 +229,12 @@ pub(crate) fn probe_generation(
                 kind,
                 tokens,
                 cached_tokens,
-            } => eprintln!("Encoded {kind:?}: {tokens} tokens; cache prefix {cached_tokens}."),
+            } => {
+                if first_commit.is_none() {
+                    prefilled = Some(ready.elapsed());
+                }
+                eprintln!("Encoded {kind:?}: {tokens} tokens; cache prefix {cached_tokens}.")
+            }
             Event::Step {
                 canvas_index,
                 report,
@@ -208,10 +246,14 @@ pub(crate) fn probe_generation(
                 canvas_index,
                 tokens,
                 finish_reason,
-            } => eprintln!(
-                "Committed canvas {canvas_index}: {} tokens; finish {finish_reason:?}.",
-                tokens.len()
-            ),
+            } => {
+                first_commit.get_or_insert_with(std::time::Instant::now);
+                last_commit = Some(std::time::Instant::now());
+                eprintln!(
+                    "Committed canvas {canvas_index}: {} tokens; finish {finish_reason:?}.",
+                    tokens.len()
+                )
+            }
         }
     }
     let output = session.result().expect("finished session");
@@ -233,6 +275,37 @@ pub(crate) fn probe_generation(
         completion.finish, completion.generation_finish, completion.usage
     );
     eprintln!("NOT a full-canvas quality/throughput benchmark or an HTTP endpoint.");
+    if let Some(prefill) = prefilled {
+        eprintln!(
+            "Prefill: {} tokens in {:.2}s ({:.1} tok/s).",
+            prepared.ids.len(),
+            prefill.as_secs_f64(),
+            prepared.ids.len() as f64 / prefill.as_secs_f64()
+        );
+    }
+    let committed = output.tokens.len();
+    if let (Some(first), Some(last)) = (first_commit, last_commit)
+        && committed > 1
+    {
+        let seconds = (last - first).as_secs_f64();
+        eprintln!(
+            "Decode: {} tokens after the first in {seconds:.2}s ({:.2} tok/s).",
+            committed - 1,
+            (committed - 1) as f64 / seconds
+        );
+    }
+    let d = session.draft_stats();
+    if d.drafted > 0 {
+        eprintln!(
+            "Drafts: {} of {} accepted ({:.0}%); {:.1} ms per draft token, {:.1} ms per verification pass ({} passes).",
+            d.accepted,
+            d.drafted,
+            100.0 * d.accepted as f64 / d.drafted as f64,
+            d.draft_seconds * 1e3 / d.drafted as f64,
+            d.verify_seconds * 1e3 / d.verify_passes.max(1) as f64,
+            d.verify_passes
+        );
+    }
     // Diagnostics: POWER_LLM_STATS=1 prints engine stage and pool timing totals.
     if std::env::var_os("POWER_LLM_STATS").is_some() {
         for (stage, seconds) in power_cpu_llm::engine::stats::take() {

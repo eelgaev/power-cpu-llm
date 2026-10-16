@@ -4,9 +4,11 @@
 //! causal pass. Every token is a `Commit` event, so completion assembly,
 //! output parsing and streaming are shared with diffusion generation.
 use super::{EncodeKind, Error, Event, FinishReason, GenerationConfig, Output, Sampling, Usage};
+use crate::engine::assistant::Drafter;
 use crate::engine::text::{EncoderCache, ReferenceText};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -26,6 +28,17 @@ pub(super) struct ArRunner<'r, 'a> {
     last: Option<Vec<f32>>,
     pub(super) output: Output,
     phase: Phase,
+    /// Speculative decoding: the drafter and the most tokens it drafts per
+    /// verification pass.
+    drafter: Option<(&'r Drafter<'a>, usize)>,
+    /// Tokens accepted by a verification pass, committed one per `advance`.
+    accepted: VecDeque<u32>,
+    pub(super) drafted: usize,
+    pub(super) drafts_accepted: usize,
+    /// Wall time drafting and verifying, and verification passes.
+    pub(super) draft_time: std::time::Duration,
+    pub(super) verify_time: std::time::Duration,
+    pub(super) verify_passes: usize,
 }
 
 impl<'r, 'a> ArRunner<'r, 'a> {
@@ -91,11 +104,27 @@ impl<'r, 'a> ArRunner<'r, 'a> {
             last: None,
             output,
             phase: Phase::Prefill,
+            drafter: None,
+            accepted: VecDeque::new(),
+            drafted: 0,
+            drafts_accepted: 0,
+            draft_time: std::time::Duration::ZERO,
+            verify_time: std::time::Duration::ZERO,
+            verify_passes: 0,
         };
         if zero {
             runner.finish(FinishReason::Length);
         }
         Ok(runner)
+    }
+
+    /// Speculative decoding with `drafter`, at most `max_draft` (>= 1)
+    /// tokens per verification pass. Every committed token is still sampled
+    /// from the target's logits at its own position, with one draw each, so
+    /// the output is the same as without a drafter (up to the rounding of a
+    /// multi-position pass on the approximate backends).
+    pub(super) fn set_drafter(&mut self, drafter: &'r Drafter<'a>, max_draft: usize) {
+        self.drafter = (max_draft > 0).then_some((drafter, max_draft));
     }
 
     pub(super) fn is_finished(&self) -> bool {
@@ -106,6 +135,7 @@ impl<'r, 'a> ArRunner<'r, 'a> {
         self.output.finish_reason = Some(reason);
         self.phase = Phase::Finished;
         self.last = None;
+        self.accepted.clear();
     }
 
     pub(super) fn advance(&mut self) -> Result<Event, Error> {
@@ -142,39 +172,122 @@ impl<'r, 'a> ArRunner<'r, 'a> {
                 })
             }
             Phase::Generate => {
+                if let Some(token) = self.accepted.pop_front() {
+                    return Ok(self.commit(token));
+                }
+                if let (Some((drafter, max_draft)), Some(&previous)) =
+                    (self.drafter, self.output.tokens.last())
+                {
+                    return self.speculate(drafter, max_draft, previous);
+                }
                 // Append the previous token first (none for the first step).
                 if let Some(&previous) = self.output.tokens.last() {
                     let hidden = self.runtime.encode(&[previous], &mut self.cache)?;
                     self.last = hidden.into_iter().last();
                     self.output.usage.encoder_passes += 1;
                 }
+                // Kept: a drafter's next step starts from this row.
                 let last = self
                     .last
-                    .take()
+                    .clone()
                     .ok_or(Error::Contract("missing last hidden row"))?;
                 let logits = self.runtime.logits(&[last])?;
                 let token = sample(&logits, &self.config.sampling, &mut self.rng)?;
-                self.output.tokens.push(token);
-                self.output.usage.completion_tokens += 1;
-                self.output.usage.decoder_passes += 1;
-                let index = self.output.tokens.len() - 1;
-                let finish = if self.config.eos_ids.contains(&token) {
-                    Some(FinishReason::Eos)
-                } else if self.output.tokens.len() == self.config.max_new_tokens {
-                    Some(FinishReason::Length)
-                } else {
-                    None
-                };
-                if let Some(reason) = finish {
-                    self.finish(reason);
-                }
-                Ok(Event::Commit {
-                    canvas_index: index,
-                    tokens: vec![token],
-                    finish_reason: finish,
-                })
+                Ok(self.commit(token))
             }
         }
+    }
+
+    fn commit(&mut self, token: u32) -> Event {
+        self.output.tokens.push(token);
+        self.output.usage.completion_tokens += 1;
+        self.output.usage.decoder_passes += 1;
+        let index = self.output.tokens.len() - 1;
+        let finish = if self.config.eos_ids.contains(&token) {
+            Some(FinishReason::Eos)
+        } else if self.output.tokens.len() == self.config.max_new_tokens {
+            Some(FinishReason::Length)
+        } else {
+            None
+        };
+        if let Some(reason) = finish {
+            self.finish(reason);
+        }
+        Event::Commit {
+            canvas_index: index,
+            tokens: vec![token],
+            finish_reason: finish,
+        }
+    }
+
+    /// Drafts up to `max_draft` tokens after `previous` (committed, not yet
+    /// encoded), verifies `[previous, drafts...]` in one target pass, keeps the
+    /// positions whose input was right, and commits the first accepted token
+    /// (the rest are queued).
+    fn speculate(
+        &mut self,
+        drafter: &Drafter<'a>,
+        max_draft: usize,
+        previous: u32,
+    ) -> Result<Event, Error> {
+        let mut h = self
+            .last
+            .take()
+            .ok_or(Error::Contract("missing last hidden row"))?;
+        // The verification pass commits at most `drafts + 1` tokens.
+        let budget = max_draft.min(self.config.max_new_tokens - self.output.tokens.len() - 1);
+        let position = self.cache.total_tokens();
+        let compute = self.runtime.compute();
+        let started = std::time::Instant::now();
+        let mut drafts = Vec::with_capacity(budget);
+        let mut token = previous;
+        for _ in 0..budget {
+            let draft = drafter.step(&self.cache, token, &h, position, compute)?;
+            token = draft.token;
+            h = draft.hidden;
+            drafts.push(token);
+            if self.config.eos_ids.contains(&token) {
+                break;
+            }
+        }
+        self.drafted += drafts.len();
+        self.draft_time += started.elapsed();
+        let started = std::time::Instant::now();
+        let mut inputs = Vec::with_capacity(drafts.len() + 1);
+        inputs.push(previous);
+        inputs.extend_from_slice(&drafts);
+        let vocabulary = self.runtime.specification().vocabulary;
+        let (runtime, sampling, rng, eos) = (
+            self.runtime,
+            &self.config.sampling,
+            &mut self.rng,
+            &self.config.eos_ids,
+        );
+        let mut accepted = Vec::with_capacity(inputs.len());
+        let hidden = self
+            .runtime
+            .encode_speculative(&inputs, &mut self.cache, &mut |rows| {
+                let logits = runtime.logits(rows)?;
+                for (i, row) in logits.chunks_exact(vocabulary).enumerate() {
+                    let token = sample(row, sampling, rng)
+                        .map_err(|_| crate::engine::operators::Error::Parameter("sampling"))?;
+                    accepted.push(token);
+                    // Row i + 1 is valid only if this row's token is the draft it
+                    // was computed for.
+                    if drafts.get(i) != Some(&token) || eos.contains(&token) {
+                        break;
+                    }
+                }
+                Ok(accepted.len())
+            })?;
+        self.output.usage.encoder_passes += 1;
+        self.verify_time += started.elapsed();
+        self.verify_passes += 1;
+        self.drafts_accepted += accepted.len() - 1;
+        self.last = hidden.into_iter().nth(accepted.len() - 1);
+        let first = accepted[0];
+        self.accepted.extend(&accepted[1..]);
+        Ok(self.commit(first))
     }
 }
 

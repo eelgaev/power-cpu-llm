@@ -6,15 +6,15 @@ Host: IBM AC922 with two 20-core POWER9 sockets (SMT4), RHEL 8.10, default relea
 
 Same setup and prompts as below, short prompt only, after the hand-written prefill tile and epilogue, decode attention (two heads per K/V pass), batched GELU and DSCR prefetch depth 7 on the workers.
 
-| Model | Runtime backend | Prefill tok/s short | Decode ms/token | Before (2026-10-14) | Same tokens |
+| Model | Runtime backend | Prefill tok/s short | Decode tok/s | Before (2026-10-14): prefill / decode tok/s | Same tokens |
 |---|---|---:|---:|---|---|
-| E2B | `power9-int8x2` | 69.8 | 34.8 | 62.3 / 38.0 | yes |
-| E2B | `power9-int8` | 116.8 | 36.4 | 104.7 / 39.7 | no |
-| E2B | `power9-fma` | 11.6 | 846 | 11.6 / 848 | (exact) |
-| E2B | `portable` | 7.7 | 1,233 | 7.7 / 1,236 | (exact) |
-| 26B-A4B | `power9-int8x2` | 44.4 | 57.0 | 40.5 / 68.2 | yes |
-| 26B-A4B | `power9-int8` | 73.4 | 59.6 | 67.1 / 69.8 | no |
-| 26B-A4B | `power9-fma` | 6.2 | 1,476 | 6.1 / 1,476 | (exact) |
+| E2B | `power9-int8x2` | 69.8 | 28.7 | 62.3 / 26.3 | yes |
+| E2B | `power9-int8` | 116.8 | 27.5 | 104.7 / 25.2 | no |
+| E2B | `power9-fma` | 11.6 | 1.18 | 11.6 / 1.18 | (exact) |
+| E2B | `portable` | 7.7 | 0.81 | 7.7 / 0.81 | (exact) |
+| 26B-A4B | `power9-int8x2` | 44.4 | 17.5 | 40.5 / 14.7 | yes |
+| 26B-A4B | `power9-int8` | 73.4 | 16.8 | 67.1 / 14.3 | no |
+| 26B-A4B | `power9-fma` | 6.2 | 0.68 | 6.1 / 0.68 | (exact) |
 
 ## Eight cores, every backend combination (2026-10-14, before the kernel work above)
 
@@ -27,33 +27,33 @@ Same setup and prompts as below, short prompt only, after the hand-written prefi
 
 ### Gemma 4 E2B (QAT Q4)
 
-| Runtime backend | Prefill backend | Prefill tok/s short | Prefill tok/s long | Decode ms/token | Same tokens |
+| Runtime backend | Prefill backend | Prefill tok/s short | Prefill tok/s long | Decode tok/s | Same tokens |
 |---|---|---:|---:|---:|---|
-| `power9-int8x2` | — | 62.3 | 59.3 | 38.0 | yes |
-| `power9-int8` | — | 104.7 | 96.7 | 39.7 | no |
-| `power9-int8` | `power9-int8x2` | 62.6 | 59.5 | 40.0 | no |
-| `power9-fma` | — | 11.6 | 8.9 | 848 | (exact) |
-| `power9-fma` | `power9-int8x2` | 58.7 | 57.5 | 847 | yes |
-| `power9-fma` | `power9-int8` | 93.0 | 91.1 | 847 | no |
-| `power9-int8x2` | `power9-fma` | 11.6 | 8.9 | 38.1 | yes |
-| `portable` | — | 7.7 | — | 1,236 | (exact) |
-| `power9-int8x2` (repeat) | — | 62.7 | 59.4 | 37.8 | yes |
+| `power9-int8x2` | — | 62.3 | 59.3 | 26.3 | yes |
+| `power9-int8` | — | 104.7 | 96.7 | 25.2 | no |
+| `power9-int8` | `power9-int8x2` | 62.6 | 59.5 | 25.0 | no |
+| `power9-fma` | — | 11.6 | 8.9 | 1.18 | (exact) |
+| `power9-fma` | `power9-int8x2` | 58.7 | 57.5 | 1.18 | yes |
+| `power9-fma` | `power9-int8` | 93.0 | 91.1 | 1.18 | no |
+| `power9-int8x2` | `power9-fma` | 11.6 | 8.9 | 26.2 | yes |
+| `portable` | — | 7.7 | — | 0.81 | (exact) |
+| `power9-int8x2` (repeat) | — | 62.7 | 59.4 | 26.5 | yes |
 
 ### Gemma 4 26B-A4B (QAT UD-Q4_K_XL)
 
-| Runtime backend | Prefill backend | Prefill tok/s short | Prefill tok/s long | Decode ms/token | Same tokens |
+| Runtime backend | Prefill backend | Prefill tok/s short | Prefill tok/s long | Decode tok/s | Same tokens |
 |---|---|---:|---:|---:|---|
-| `power9-int8x2` | — | 40.5 | 37.4 | 68.2 | yes |
-| `power9-int8` | — | 67.1 | 58.6 | 69.8 | no |
-| `power9-int8` | `power9-int8x2` | 40.5 | 37.3 | 69.9 | no |
-| `power9-fma` | — | 6.1 | 4.3 | 1,476 | (exact) |
-| `power9-fma` | `power9-int8x2` | 34.9 | 35.8 | 1,476 | yes |
-| `power9-fma` | `power9-int8` | 52.9 | 55.2 | 1,478 | yes, on this prompt |
-| `power9-int8x2` | `power9-fma` | 6.1 | — | 68.2 | yes |
+| `power9-int8x2` | — | 40.5 | 37.4 | 14.7 | yes |
+| `power9-int8` | — | 67.1 | 58.6 | 14.3 | no |
+| `power9-int8` | `power9-int8x2` | 40.5 | 37.3 | 14.3 | no |
+| `power9-fma` | — | 6.1 | 4.3 | 0.68 | (exact) |
+| `power9-fma` | `power9-int8x2` | 34.9 | 35.8 | 0.68 | yes |
+| `power9-fma` | `power9-int8` | 52.9 | 55.2 | 0.68 | yes, on this prompt |
+| `power9-int8x2` | `power9-fma` | 6.1 | — | 14.7 | yes |
 
 **Notes:**
 - The opt-in `power9-int8` prefills 1.65–1.7× faster than the default and decodes at about the same speed, but its tokens differ from the exact ones.
-- Decode speed is set by the runtime backend. An exact runtime backend with a fast prefill backend still decodes at 0.85–1.5 s per token.
+- Decode speed is set by the runtime backend. An exact runtime backend with a fast prefill backend still decodes at only 0.7–1.2 tok/s.
 - `power9-int8x2` with `power9-fma` prefill gives the default's tokens at the exact backend's prefill speed. It has no use.
 - A single-plane prefill under an int8x2 runtime (`--prefill-backend power9-int8`) is rejected: it changes prompt K/V and expert routing.
 
@@ -61,26 +61,26 @@ Same setup and prompts as below, short prompt only, after the hand-written prefi
 
 The same prompts and configurations on both sockets: `numactl --physcpubind=0-159` (no membind), `--workers 80 --split-sockets`. Prompt chunks are divided between the sockets, each with its own copy of the packed weights, and decode runs on socket 0. Socket 1 also runs other work, so these runs are noisier. Every run produced the same token IDs as its eight-core twin.
 
-| Model | Runtime backend | Prefill backend | Prefill tok/s short | Prefill tok/s long | Decode ms/token |
+| Model | Runtime backend | Prefill backend | Prefill tok/s short | Prefill tok/s long | Decode tok/s |
 |---|---|---|---:|---:|---:|
-| E2B | `power9-int8x2` | — | 109.4 | 105.6 | 31.3 |
-| E2B | `power9-int8` | — | 179.4 | 169.8 | 37.1 |
-| E2B | `power9-int8` | `power9-int8x2` | 105.0 | 105.5 | 36.3 |
-| E2B | `power9-fma` | — | 25.6 | 20.2 | 402 |
-| E2B | `power9-fma` | `power9-int8x2` | 103.7 | 103.7 | 404 |
-| E2B | `power9-fma` | `power9-int8` | 160.6 | 165.4 | 402 |
-| E2B | `power9-int8x2` | `power9-fma` | 25.9 | 20.1 | 32.3 |
-| E2B | `portable` | — | 17.7 | — | 604 |
-| E2B | `power9-int8x2` (repeat) | — | 111.3 | 106.1 | 36.0 |
-| 26B-A4B | `power9-int8x2` | — | 114.0 | 104.2 | 52.1 |
-| 26B-A4B | `power9-int8` | — | 164.8 | 156.7 | 53.2 |
-| 26B-A4B | `power9-int8` | `power9-int8x2` | 120.0 | 107.8 | 52.8 |
-| 26B-A4B | `power9-fma` | — | 20.3 | 14.0 | 719 |
-| 26B-A4B | `power9-fma` | `power9-int8x2` | 88.8 | 97.6 | 721 |
-| 26B-A4B | `power9-fma` | `power9-int8` | 115.8 | 132.5 | 721 |
-| 26B-A4B | `power9-int8x2` | `power9-fma` | 19.3 | 14.0 | 50.2 |
-| 26B-A4B | `portable` | — | 13.7 | — | 1,049 |
-| 26B-A4B | `power9-int8x2` (repeat) | — | 113.2 | 106.3 | 50.4 |
+| E2B | `power9-int8x2` | — | 109.4 | 105.6 | 31.9 |
+| E2B | `power9-int8` | — | 179.4 | 169.8 | 27.0 |
+| E2B | `power9-int8` | `power9-int8x2` | 105.0 | 105.5 | 27.5 |
+| E2B | `power9-fma` | — | 25.6 | 20.2 | 2.49 |
+| E2B | `power9-fma` | `power9-int8x2` | 103.7 | 103.7 | 2.48 |
+| E2B | `power9-fma` | `power9-int8` | 160.6 | 165.4 | 2.49 |
+| E2B | `power9-int8x2` | `power9-fma` | 25.9 | 20.1 | 31.0 |
+| E2B | `portable` | — | 17.7 | — | 1.66 |
+| E2B | `power9-int8x2` (repeat) | — | 111.3 | 106.1 | 27.8 |
+| 26B-A4B | `power9-int8x2` | — | 114.0 | 104.2 | 19.2 |
+| 26B-A4B | `power9-int8` | — | 164.8 | 156.7 | 18.8 |
+| 26B-A4B | `power9-int8` | `power9-int8x2` | 120.0 | 107.8 | 18.9 |
+| 26B-A4B | `power9-fma` | — | 20.3 | 14.0 | 1.39 |
+| 26B-A4B | `power9-fma` | `power9-int8x2` | 88.8 | 97.6 | 1.39 |
+| 26B-A4B | `power9-fma` | `power9-int8` | 115.8 | 132.5 | 1.39 |
+| 26B-A4B | `power9-int8x2` | `power9-fma` | 19.3 | 14.0 | 19.9 |
+| 26B-A4B | `portable` | — | 13.7 | — | 0.95 |
+| 26B-A4B | `power9-int8x2` (repeat) | — | 113.2 | 106.3 | 19.8 |
 
 DiffusionGemma, with the model's canvas policy on the short prompt:
 

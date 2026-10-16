@@ -283,6 +283,17 @@ impl LayerCache<'_> {
         self.values.truncate(pending.old_len);
         self.total = pending.old_total;
     }
+    /// Keep only the first `tokens` positions of an uncommitted in-place step
+    /// (speculative verification), before [`Self::commit`].
+    pub(crate) fn keep(&mut self, pending: &PendingKv, tokens: usize) {
+        let width = self.geometry.kv_heads * self.geometry.head_dim;
+        let len = pending.old_len + tokens * width;
+        if len < self.keys.len() {
+            self.keys.truncate(len);
+            self.values.truncate(len);
+        }
+        self.total = pending.old_total + tokens;
+    }
     /// Apply window eviction after a successful pass: sliding layers keep the
     /// last `window - 1` tokens (as `DynamicSlidingWindowLayer`). The dead
     /// prefix is dropped once it is at least half the buffer.

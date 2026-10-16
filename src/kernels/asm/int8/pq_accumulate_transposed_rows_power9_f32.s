@@ -132,7 +132,8 @@ pq_accumulate_transposed_rows_power9_f32: # @pq_accumulate_transposed_rows_power
 	li 12, 1
 	sld 11, 12, 11
 	rldic 12, 12, 35, 28
-	ori 12, 12, 20807
+	ori 12, 12, 29127                      # hand edit: + Q5_1 (bit 7), Q5_K (bit 13)
+	oris 12, 12, 16384                     # hand edit: + BF16 (bit 30)
 	and. 11, 11, 12
 	beq	0, .Lp9_int8_BB8_10
 # %bb.15:

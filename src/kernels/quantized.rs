@@ -359,6 +359,8 @@ pub fn finish(accumulator: &[f64], out: &mut [f32]) -> Result<(), Error> {
 pub mod int8;
 pub mod power9_fma;
 #[cfg(all(feature = "power9", target_arch = "powerpc64"))]
+mod tile_k_decode;
+#[cfg(all(feature = "power9", target_arch = "powerpc64"))]
 mod tile_q4_0;
 #[cfg(all(feature = "power9", target_arch = "powerpc64"))]
 mod tile_q4_0_decode;

@@ -137,7 +137,7 @@ pub struct PreparedChat {
 pub struct ChatTemplate {
     env: Environment<'static>,
     /// `special_tokens_map` as transformers passes it to the template.
-    special_tokens: [(&'static str, String); 5],
+    special_tokens: Vec<(&'static str, String)>,
     special_texts: Vec<String>,
 }
 
@@ -150,6 +150,39 @@ impl fmt::Debug for ChatTemplate {
 impl ChatTemplate {
     /// Compiles `source` (a Jinja chat template) for rendering.
     pub fn new(source: &str, tokenizer: &Tokenizer) -> Result<Self, Error> {
+        let text = |id: u32| {
+            tokenizer
+                .token(id)
+                .map(str::to_owned)
+                .ok_or(tokenizer::Error::TokenOutOfRange(id))
+        };
+        let mask = tokenizer
+            .mask()
+            .ok_or_else(|| request("tokenizer has no mask token"))?;
+        Self::with_tokens(
+            source,
+            vec![
+                ("bos_token", text(tokenizer.bos())?),
+                ("eos_token", text(tokenizer.eos())?),
+                ("unk_token", text(tokenizer.unknown())?),
+                ("pad_token", text(tokenizer.padding())?),
+                ("mask_token", text(mask)?),
+            ],
+            tokenizer
+                .special_tokens()
+                .map(|(text, _)| text.to_owned())
+                .collect(),
+        )
+    }
+
+    /// As [`Self::new`] for any tokenizer: `special_tokens` is the template's
+    /// `special_tokens_map` (`("bos_token", "<s>")`, ...), `special_texts` the
+    /// token texts [`SpecialText::Reject`] refuses in requests.
+    pub fn with_tokens(
+        source: &str,
+        special_tokens: Vec<(&'static str, String)>,
+        special_texts: Vec<String>,
+    ) -> Result<Self, Error> {
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -166,6 +199,10 @@ impl ChatTemplate {
             py_str(value).map(|s| s.trim_matches(py_isspace).to_owned())
         });
         env.add_filter("dictsort", py_dictsort);
+        // Python Jinja: `none is iterable` is false (minijinja says true).
+        env.add_test("iterable", |value: &Jinja| {
+            !value.is_none() && value.try_iter().is_ok()
+        });
         env.add_function(
             "raise_exception",
             |message: String| -> Result<Jinja, minijinja::Error> {
@@ -174,28 +211,10 @@ impl ChatTemplate {
         );
         env.add_template_owned("chat", source.to_owned())
             .map_err(|e| Error::Template(e.to_string()))?;
-        let text = |id: u32| {
-            tokenizer
-                .token(id)
-                .map(str::to_owned)
-                .ok_or(tokenizer::Error::TokenOutOfRange(id))
-        };
-        let mask = tokenizer
-            .mask()
-            .ok_or_else(|| request("tokenizer has no mask token"))?;
         Ok(Self {
             env,
-            special_tokens: [
-                ("bos_token", text(tokenizer.bos())?),
-                ("eos_token", text(tokenizer.eos())?),
-                ("unk_token", text(tokenizer.unknown())?),
-                ("pad_token", text(tokenizer.padding())?),
-                ("mask_token", text(mask)?),
-            ],
-            special_texts: tokenizer
-                .special_tokens()
-                .map(|(text, _)| text.to_owned())
-                .collect(),
+            special_tokens,
+            special_texts,
         })
     }
 
@@ -674,6 +693,42 @@ fn py_method(
             Ok(Jinja::from(
                 text.split(sep).map(Jinja::from).collect::<Vec<_>>(),
             ))
+        }
+        (ValueKind::String, "startswith" | "endswith", [affix])
+            if affix.kind() == ValueKind::String =>
+        {
+            let (text, affix) = (
+                value.as_str().unwrap_or_default(),
+                affix.as_str().unwrap_or_default(),
+            );
+            Ok(Jinja::from(if method == "startswith" {
+                text.starts_with(affix)
+            } else {
+                text.ends_with(affix)
+            }))
+        }
+        // Python str.strip/lstrip/rstrip: whitespace, or any of `chars`.
+        (ValueKind::String, "strip" | "lstrip" | "rstrip", chars) if chars.len() <= 1 => {
+            let text = value.as_str().unwrap_or_default();
+            let set: Option<Vec<char>> = match chars.first() {
+                None => None,
+                Some(c) if c.is_none() => None,
+                Some(c) => Some(
+                    c.as_str()
+                        .ok_or_else(|| unsupported("str.strip chars must be a string"))?
+                        .chars()
+                        .collect(),
+                ),
+            };
+            let strip = |c: char| {
+                set.as_ref()
+                    .map_or_else(|| py_isspace(c), |s| s.contains(&c))
+            };
+            Ok(Jinja::from(match method {
+                "lstrip" => text.trim_start_matches(strip),
+                "rstrip" => text.trim_end_matches(strip),
+                _ => text.trim_matches(strip),
+            }))
         }
         _ => Err(minijinja::Error::new(
             ErrorKind::UnknownMethod,

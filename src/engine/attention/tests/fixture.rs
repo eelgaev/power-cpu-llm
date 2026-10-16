@@ -82,6 +82,70 @@ fn metadata(out: &mut Vec<u8>, value: &MetadataValue) {
         }
     }
 }
+/// A deterministic weight value in [-0.62, 0.62), varying by tensor name.
+pub(crate) fn pattern(name: &str, i: usize) -> f32 {
+    let seed: usize = name
+        .bytes()
+        .enumerate()
+        .map(|(i, c)| (i + 1) * usize::from(c))
+        .sum();
+    ((seed + i * 13) % 37) as f32 / 29.0 - 0.62
+}
+
+/// Serializes `inventory`'s metadata and F32 tensors (element `i` of tensor
+/// `name` is `value(name, i)`) to a new temporary GGUF file.
+pub(crate) fn write_gguf(
+    inventory: &crate::gguf::Inventory,
+    value: impl Fn(&str, usize) -> f32,
+) -> (PathBuf, BTreeMap<String, Vec<f32>>) {
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&(inventory.tensors.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&(inventory.metadata.len() as u64).to_le_bytes());
+    for (key, value) in &inventory.metadata {
+        string(&mut bytes, key);
+        metadata(&mut bytes, value);
+    }
+    let mut data = Vec::new();
+    let mut weights = BTreeMap::new();
+    for tensor in &inventory.tensors {
+        let name = &tensor.name;
+        let count = tensor.shape.iter().product::<u64>() as usize;
+        let values: Vec<_> = (0..count).map(|i| value(name, i)).collect();
+        data.resize(data.len().div_ceil(32) * 32, 0);
+        string(&mut bytes, name);
+        let dims = tensor
+            .shape
+            .iter()
+            .rposition(|&d| d != 1)
+            .map_or(1, |i| i + 1);
+        bytes.extend_from_slice(&(dims as u32).to_le_bytes());
+        for d in &tensor.shape[..dims] {
+            bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        for n in &values {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        weights.insert(name.clone(), values);
+    }
+    bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+    bytes.extend(data);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "power-block-{}-{}.gguf",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&bytes).unwrap();
+    (path, weights)
+}
 impl Fixture {
     pub fn new() -> Self {
         Self::with_embedding_shape(4, 8)
@@ -100,71 +164,19 @@ impl Fixture {
             "diffusion-gemma.attention.sliding_window".into(),
             MetadataValue::Unsigned(3),
         );
-        let mut bytes = b"GGUF".to_vec();
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&(inventory.tensors.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&(inventory.metadata.len() as u64).to_le_bytes());
-        for (key, value) in &inventory.metadata {
-            string(&mut bytes, key);
-            metadata(&mut bytes, value);
-        }
-        let mut data = Vec::new();
-        let mut weights = BTreeMap::new();
-        for tensor in &inventory.tensors {
-            let name = &tensor.name;
-            let count = tensor.shape.iter().product::<u64>() as usize;
-            let seed: usize = name
-                .bytes()
-                .enumerate()
-                .map(|(i, c)| (i + 1) * usize::from(c))
-                .sum();
-            let values: Vec<_> = (0..count)
-                .map(|i| {
-                    if name.contains("enc_layer_output_scale") {
-                        0.7
-                    } else if name.contains("layer_output_scale") {
-                        1.15
-                    } else if name == "rope_freqs.weight" {
-                        if i == 0 { 1.0 } else { 1e30 }
-                    } else if name.contains("norm") || name.ends_with(".scale") {
-                        0.6 + (i % 7) as f32 * 0.11
-                    } else {
-                        ((seed + i * 13) % 37) as f32 / 29.0 - 0.62
-                    }
-                })
-                .collect();
-            data.resize(data.len().div_ceil(32) * 32, 0);
-            string(&mut bytes, name);
-            let dims = tensor
-                .shape
-                .iter()
-                .rposition(|&d| d != 1)
-                .map_or(1, |i| i + 1);
-            bytes.extend_from_slice(&(dims as u32).to_le_bytes());
-            for d in &tensor.shape[..dims] {
-                bytes.extend_from_slice(&d.to_le_bytes());
+        let (path, weights) = write_gguf(&inventory, |name, i| {
+            if name.contains("enc_layer_output_scale") {
+                0.7
+            } else if name.contains("layer_output_scale") {
+                1.15
+            } else if name == "rope_freqs.weight" {
+                if i == 0 { 1.0 } else { 1e30 }
+            } else if name.contains("norm") || name.ends_with(".scale") {
+                0.6 + (i % 7) as f32 * 0.11
+            } else {
+                pattern(name, i)
             }
-            bytes.extend_from_slice(&0u32.to_le_bytes());
-            bytes.extend_from_slice(&(data.len() as u64).to_le_bytes());
-            for n in &values {
-                data.extend_from_slice(&n.to_le_bytes());
-            }
-            weights.insert(name.clone(), values);
-        }
-        bytes.resize(bytes.len().div_ceil(32) * 32, 0);
-        bytes.extend(data);
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "power-block-{}-{}.gguf",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        file.write_all(&bytes).unwrap();
+        });
         Self { path, weights }
     }
     fn project(&self, name: &str, input: &[f32], expert: Option<usize>) -> Vec<f32> {

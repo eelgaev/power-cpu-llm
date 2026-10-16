@@ -139,7 +139,8 @@ pq_accumulate_transposed_rows_power9_fma: # @pq_accumulate_transposed_rows_power
 	li 0, 1
 	sld 12, 0, 12
 	rldic 0, 0, 35, 28
-	ori 0, 0, 20807
+	ori 0, 0, 29127                      # hand edit: + Q5_1 (bit 7), Q5_K (bit 13)
+	oris 0, 0, 16384                     # hand edit: + BF16 (bit 30)
 	and. 12, 12, 0
 	beq	0, .Lp9_fma_BB1_10
 # %bb.15:
