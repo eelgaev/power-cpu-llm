@@ -42,6 +42,13 @@ pub struct ServeArgs {
     /// Prompt tokens per encoder pass (results do not depend on it)
     #[arg(long, default_value = "256")]
     encoder_chunk: NonZeroUsize,
+    /// Require `Authorization: Bearer <KEY>` on every request
+    #[arg(long, conflicts_with = "api_key_file")]
+    api_key: Option<String>,
+    /// As --api-key, read from a file (first line; keeps the key out of the
+    /// process list)
+    #[arg(long)]
+    api_key_file: Option<PathBuf>,
 }
 
 fn backend(value: &str) -> Result<MatrixBackend, String> {
@@ -81,6 +88,19 @@ pub fn serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
             std::fs::read_to_string(path).map_err(|error| format!("--template {path}: {error}"))?,
         ),
     };
+    let api_key = match (args.api_key, args.api_key_file) {
+        (Some(key), _) => Some(key),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|error| format!("--api-key-file {}: {error}", path.display()))?
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        ),
+        (None, None) => None,
+    };
     let config = ServerConfig {
         model_id,
         model_path: args.model,
@@ -92,6 +112,7 @@ pub fn serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
         encoder_chunk: args.encoder_chunk.get(),
         prefill_backend: args.prefill_backend,
         split_sockets: args.split_sockets,
+        api_key,
     };
     Server::load(config)
         .map_err(std::io::Error::other)?

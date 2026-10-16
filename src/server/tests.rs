@@ -9,6 +9,9 @@ fn body() -> Value {
     json!({"messages":[{"role":"user","content":"Hello"}]})
 }
 fn state(queue: usize) -> (AppState, mpsc::Receiver<Job>) {
+    keyed_state(queue, None)
+}
+fn keyed_state(queue: usize, api_key: Option<&str>) -> (AppState, mpsc::Receiver<Job>) {
     let (jobs, receiver) = mpsc::channel(queue + 1);
     (
         AppState {
@@ -17,6 +20,7 @@ fn state(queue: usize) -> (AppState, mpsc::Receiver<Job>) {
             jobs,
             slots: Arc::new(Semaphore::new(queue + 1)),
             counter: Arc::new(AtomicU64::new(1)),
+            api_key: api_key.map(Arc::from),
         },
         receiver,
     )
@@ -225,4 +229,44 @@ fn sampling_fields_only_for_autoregressive_models() {
     let mut bad = body();
     bad["temperature"] = json!(5.0);
     assert!(ChatInput::parse(bad, "test", true).is_err());
+}
+
+#[tokio::test]
+async fn api_key_is_required_when_set() {
+    let (state, _receiver) = keyed_state(1, Some("sekret"));
+    let router = make_router(state);
+    let models = |auth: Option<&str>| {
+        let mut builder = Request::builder().uri("/v1/models");
+        if let Some(auth) = auth {
+            builder = builder.header("authorization", auth);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    for auth in [
+        None,
+        Some("Bearer wrong"),
+        Some("sekret"),
+        Some("Bearer sekre"),
+    ] {
+        let response = router.clone().oneshot(models(auth)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_api_key");
+    }
+    let response = router
+        .clone()
+        .oneshot(models(Some("Bearer sekret")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Chat and unknown endpoints are covered too.
+    let response = router.clone().oneshot(request(body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let unknown = Request::builder()
+        .uri("/v1/other")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(unknown).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

@@ -61,6 +61,8 @@ pub struct ServerConfig {
     /// Split prompt chunks between two CPU packages (see
     /// `ReferenceText::new_split_sockets`); decoding stays on the first.
     pub split_sockets: bool,
+    /// When set, every request must carry `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +146,8 @@ struct AppState {
     jobs: mpsc::Sender<Job>,
     slots: Arc<Semaphore>,
     counter: Arc<AtomicU64>,
+    /// Required bearer token (`None`: no authentication).
+    api_key: Option<Arc<str>>,
 }
 
 pub struct Server {
@@ -158,6 +162,10 @@ impl Server {
         let (jobs, mut receiver) = mpsc::channel::<Job>(config.queue + 1);
         let (startup, initialized) = std::sync::mpsc::sync_channel(1);
         let model_id = config.model_id.clone();
+        let api_key = match config.api_key.as_deref() {
+            Some("") => return Err("the API key must not be empty".into()),
+            key => key.map(Arc::from),
+        };
         std::thread::Builder::new().name("power-cpu-llm-generation".into()).spawn(move || {
             let mut run = || -> Result<(), String> {
                 let file = ModelFile::open(&config.model_path).map_err(|error| error.to_string())?;
@@ -195,6 +203,7 @@ impl Server {
                 jobs,
                 slots: Arc::new(Semaphore::new(config.queue + 1)),
                 counter: Arc::new(AtomicU64::new(1)),
+                api_key,
             }),
         })
     }
@@ -239,7 +248,47 @@ fn make_router(state: AppState) -> Router {
             }
         })
         .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authenticate,
+        ))
         .with_state(state)
+}
+
+/// Rejects requests without the configured bearer token (OpenAI's 401
+/// error shape); passes everything when no key is set.
+async fn authenticate(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(key) = &state.api_key {
+        let given = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim);
+        if !given.is_some_and(|given| same_secret(given.as_bytes(), key.as_bytes())) {
+            return ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                message: "missing or incorrect API key (Authorization: Bearer <key>)".into(),
+                code: "invalid_api_key",
+                param: None,
+            }
+            .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// Byte equality whose time does not depend on where the inputs differ.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = u8::from(a.len() != b.len());
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 async fn models(State(state): State<AppState>) -> Json<Value> {
     Json(

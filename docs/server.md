@@ -7,14 +7,15 @@ numactl --physcpubind=0-79 --membind=0 \
   power-cpu-llm serve models/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf \
   [--bind 127.0.0.1:8080] [--model-id NAME] [--workers N] \
   [--matrix-backend power9-int8x2|power9-int8|power9-fma|portable|auto] [--prefill-backend B] \
-  [--split-sockets] [--template gguf|FILE.jinja] [--queue N] [--max-context N] [--encoder-chunk N]
+  [--split-sockets] [--template gguf|FILE.jinja] [--queue N] [--max-context N] [--encoder-chunk N] \
+  [--api-key KEY | --api-key-file FILE]
 ```
 
 `numactl` chooses the CPUs and memory node; the engine pins its workers inside that set. On a two-socket machine, `--membind` keeps the weights local to the socket that runs them.
 
 | Option | Default |
 |---|---|
-| `--bind` | `127.0.0.1:8080` (localhost only; there is no authentication) |
+| `--bind` | `127.0.0.1:8080` (localhost only) |
 | `--model-id` | the GGUF file stem |
 | `--workers` | 2 per physical core in the affinity mask. Workers beyond 2 per core join prompt attention only. |
 | `--matrix-backend` | `power9-int8x2` when available, else `auto` ([backends.md](backends.md)) |
@@ -24,6 +25,8 @@ numactl --physcpubind=0-79 --membind=0 \
 | `--queue` | 4 waiting requests (at most 64) |
 | `--max-context` | the model's context length (from the GGUF) |
 | `--encoder-chunk` | 256 prompt tokens per encoder pass; results do not depend on it |
+| `--api-key` | none: no authentication. When set, every request (including `/v1/models`) needs `Authorization: Bearer KEY`, as OpenAI clients send it; otherwise 401 with code `invalid_api_key`. |
+| `--api-key-file` | as `--api-key`, the key read from the file's first line (keeps it out of the process list) |
 
 Startup prints the resolved backend, the worker CPUs and the context limit.
 
